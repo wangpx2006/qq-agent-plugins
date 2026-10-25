@@ -1,0 +1,68 @@
+{
+  "id": "claude-bridge",
+  "name": "claude CLI 接线",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "entry": "index.js",
+  "description": "把指定的 QQ 私聊（和可选的群聊）交给本机的 claude CLI 回复，而不是让 QQ-agent 自带的模型回。\n\n【怎么用】\n· 在设置里填 ownerIds（接管谁的私聊）和 groupIds（要接管的群），空着就什么都不接管。\n· 私聊权限全开；群聊只给 Read/Grep/Glob，外加一个只含搜索的小 MCP。\n· 对方连发几条会等一会儿合并成一段再回，不会每条都单独回一次。\n· 对话存在 data\\claude-bridge\\history.json，私聊留 600 条、带进 prompt 的最近 80 条。\n· 想改回机器人原样：把 enabled 关掉，或者直接停用这个插件。\n\n【前提】本机装了 Claude Code 并且在 PATH 里能用 `claude` 命令。",
+  "author": "",
+  "enabledByDefault": false,
+  "capabilities": [
+    "claude-bridge.status"
+  ],
+  "requires": [],
+  "settings": {
+    "enabled": true,
+    "ownerIds": [],
+    "groupIds": [],
+    "selfUin": "",
+    "botNames": [],
+    "debounceMs": 7000,
+    "timeoutMs": 300000,
+    "claudeCmd": ""
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用 claude 接线",
+      "description": "关掉后一切照旧走 QQ-agent 自带的模型（钩子会摘掉，零副作用）。"
+    },
+    "ownerIds": {
+      "type": "array",
+      "label": "接管谁的私聊（QQ 号）",
+      "description": "只认这里列的号，别人的私聊一律不管。空着 = 谁都不接管。"
+    },
+    "groupIds": {
+      "type": "array",
+      "label": "接管哪些群（群号）",
+      "description": "填了才会在群里说话。群聊只给只读工具，永远不给 shell。"
+    },
+    "selfUin": {
+      "type": "string",
+      "label": "机器人自己的 QQ 号",
+      "description": "用来认出「@ 的是我」和「这条是我自己发的」，别把自己的话当别人的回。"
+    },
+    "botNames": {
+      "type": "array",
+      "label": "机器人被叫的名字",
+      "description": "群里出现这些词就算在叫它，比如 [\"小助手\",\"阿蓝\"]。"
+    },
+    "debounceMs": {
+      "type": "number",
+      "label": "连发合并（毫秒）",
+      "description": "对方连着发消息时，等这么久没有新消息再一起回。默认 7000。"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "label": "超时（毫秒）",
+      "description": "claude 超过这个时间没回就当失败，发一句兜底话。默认 300000（5 分钟）。"
+    },
+    "claudeCmd": {
+      "type": "string",
+      "label": "claude 命令路径",
+      "description": "留空就自动找 %USERPROFILE%\\AppData\\Roaming\\npm\\claude.cmd；装在别处时填完整路径。"
+    }
+  },
+  "prompt": null
+}

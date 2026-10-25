@@ -1,0 +1,69 @@
+{
+  "id": "voice-transcribe",
+  "name": "听懂语音（本地识别）",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "entry": "index.js",
+  "author": "本地自建",
+  "enabledByDefault": true,
+  "permissions": [],
+  "capabilities": ["media.transcribe"],
+  "prompt": {
+    "sections": [
+      {
+        "id": "voice-transcribe",
+        "title": "语音消息",
+        "priority": 60,
+        "content": "消息里带「[语音转文字] xxx」前缀的，是已经把对方的语音转成了文字，正常当对方说的话理解和回应，不用再追问他说了什么。只有光秃秃的「[语音]」才是没转成功——那种别猜内容、别装作听懂，直接说没听清、请他打字或者重发。"
+      }
+    ]
+  },
+  "description": "让机器人把群友/好友发的语音**转成文字再读**，而不是只看到一片 `[语音]`。\n\n【为什么不用 QQ 自带的转写】QQ 自带那条路在这套协议端上是坏的：协议端给消息的 id 是哈希合成值，不是 QQ 真实 msgId，腾讯服务端拿它查不到这条语音，请求发出去就被拒（群里报 4294966146，私聊报 error=9）。升级协议端也没用，这条路直接放弃。\n\n【换的路】语音文件本身拿得到 —— `get_record` 加 `out_format=wav` 会返回完整音频。插件拿到音频后交给本机的 faster-whisper 识别，再把文字当作这条消息的内容入库。全程离线，不联网、不调用任何付费接口、语音不外传。\n\n【怎么接进去的】注册 `media.transcribe` 能力。核心代码（src/onebot.js 的 segmentsToText）遇到 record 段时会主动找这个能力的提供者，识别成功就渲染成 `[语音转文字] xxx`。所以**关掉插件就完全恢复原状**，核心一行没改，识别失败也绝不会打断消息入库。\n\n【首次使用会慢】模型第一次要下载（small 约 480MB，走 hf-mirror 国内镜像）。之后模型常驻内存，一条几秒的语音大约 1～4 秒出字。\n\n【识别不准的时候】群里多人抢话、有回声、带口音时可能认错。可以把模型换成 medium（更准但更慢），或者关掉插件让机器人明说没听清、请对方打字。",
+  "settings": {
+    "enabled": true,
+    "port": 18791,
+    "pythonPath": "",
+    "model": "small",
+    "language": "zh",
+    "timeoutMs": 60000,
+    "debug": false
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用",
+      "description": "默认**开**。关上后语音重新变回 `[语音]` 占位，机器人会明说没听清、请你打字。"
+    },
+    "model": {
+      "type": "string",
+      "label": "识别模型",
+      "description": "默认 **small**（中文准确率和速度的平衡点，约 480MB）。\n\n· `base`：142MB，快但中文容易错字\n· `small`：480MB，推荐\n· `medium`：1.5GB，明显更准，但一条语音要等 5～10 秒\n\n改完要重启应用才生效（服务会重新加载模型）。"
+    },
+    "language": {
+      "type": "string",
+      "label": "识别语言",
+      "description": "默认 **zh**。中文群里夹英文单词照样认得出。改成 `auto` 让模型自己判断，但短语音判断容易翻车，一般不用改。"
+    },
+    "port": {
+      "type": "number",
+      "label": "本地服务端口",
+      "description": "默认 **18791**，只监听 127.0.0.1。只有跟别的软件撞端口时才需要改。"
+    },
+    "pythonPath": {
+      "type": "string",
+      "label": "Python 路径",
+      "description": "留空就用系统 PATH 里的 python。填绝对路径可以指定别的解释器，比如 `C:\\\\Python312\\\\python.exe`。"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "label": "识别超时（毫秒）",
+      "description": "默认 **60000**。第一次请求要加载模型，别设太小，否则永远超时。"
+    },
+    "debug": {
+      "type": "boolean",
+      "label": "调试日志",
+      "description": "默认**关**。打开后每次识别都会记音频大小、耗时、识别结果前几十个字，排查「为什么这条没转出来」时打开。"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+# 语音识别用
+# av 必须锁 13.1.0：19.x 和 faster-whisper 1.2.1 不兼容，
+# 会报 open() got an unexpected keyword argument 'metadata_errors'
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+av==13.1.0

@@ -1,0 +1,8 @@
+node_modules/
+*.log
+
+# 运行时数据：对话历史、表情库、下载的图、语音模型，都不该进仓库
+data/
+asr-models/
+*.bak
+*.bak-*
