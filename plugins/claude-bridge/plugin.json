@@ -5,7 +5,7 @@
   "apiVersion": 1,
   "category": "message",
   "entry": "index.js",
-  "description": "把指定的 QQ 私聊（和可选的群聊）交给本机的 claude CLI 回复，而不是让 QQ-agent 自带的模型回。\n\n【怎么用】\n· 在设置里填 ownerIds（接管谁的私聊）和 groupIds（要接管的群），空着就什么都不接管。\n· 私聊权限全开；群聊只给 Read/Grep/Glob，外加一个只含搜索的小 MCP，永远不给 shell。\n· 连发几条会等一会儿合并成一段再回，不会每条都单独回一次。\n\n【已带的功能】\n· 会话复用：同一个聊天续同一个 claude 会话，固定前缀走缓存，输入 token 能省七成以上（实测命中 75%~99%）。\n  上下文涨到 10 万 token、或闲置 8 小时，自动开新会话。\n· 用量记账：每轮 token 写进 data/sessions，面板的用量页能直接看。\n· 看图：私聊和群里的图会落地成本地文件，需要的时候用 Read 看一眼，不看就不花钱。\n· 语音：走 QQ 自己的转文字接口（snowluma 的 fetch_ptt_text），转不出来就照实说没听清。\n· 表情：认出 QQ 自带小表情和收藏表情包，能按名字接梗。\n· 记忆：私聊和群聊各有印象文件，新会话第一句自动带上。\n· 群聊：@ 到它、或者话里带它的名字才应声，没叫它就自己判断接不接。\n\n【前提】本机装了 Claude Code，并且能用 `claude` 命令。",
+  "description": "把指定的 QQ 私聊（和可选的群聊）交给本机的 claude CLI 回复，而不是让 QQ-agent 自带的模型回。\n\n【怎么用】\n· 在设置里填 ownerIds（接管谁的私聊）和 groupIds（要接管的群），空着就什么都不接管。\n· 私聊权限全开；群聊只给 Read/Grep/Glob，外加一个只含搜索的小 MCP，永远不给 shell。\n· 连发几条会等一会儿合并成一段再回，不会每条都单独回一次。\n\n【已带的功能】\n· 会话复用：同一个聊天续同一个 claude 会话，固定前缀走缓存，输入 token 能省七成以上（实测命中 75%~99%）。\n  上下文涨到 10 万 token、或闲置 24 小时，自动开新会话。\n· 用量记账：每轮 token 写进 data/sessions，面板的用量页能直接看。\n· 看图：私聊和群里的图会落地成本地文件，需要的时候用 Read 看一眼，不看就不花钱。\n· 语音：走 QQ 自己的转文字接口（snowluma 的 fetch_ptt_text），转不出来就照实说没听清。\n· 表情：认出 QQ 自带小表情和收藏表情包，能按名字接梗。\n· 记忆：私聊和群聊各有印象文件，新会话第一句自动带上。\n· 群聊：@ 到它、或者话里带它的名字才应声，没叫它就自己判断接不接。\n\n【前提】本机装了 Claude Code，并且能用 `claude` 命令。",
   "author": "",
   "enabledByDefault": false,
   "capabilities": [

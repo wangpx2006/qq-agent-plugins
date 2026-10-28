@@ -557,7 +557,7 @@ const SESSION_FILE = path.join(STATE_DIR, 'claude-sessions.json');
 const SESSION_TURNS_MAX = 200;
 // 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十万 token 过一遍也慢。
 const SESSION_TOKENS_MAX = 100000;
-const SESSION_TTL_MS = 8 * 3600 * 1000;
+const SESSION_TTL_MS = 24 * 3600 * 1000;
 // 回滚开关：改成 false 就退回「每轮新进程 + 插件自己拼历史」，缓存也没了但一定跑得通。
 const USE_SESSION = true;
 
