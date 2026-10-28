@@ -423,7 +423,7 @@ function buildPrompt(lines, chatKey) {
     }
   }
 
-  // 回复前先把外面写的并进来，否则我发的学习内容、日报它根本看不见（2026-10-24 连栽两次）
+  // 回复前先把外面写的并进来，否则别的脚本推过去的话它根本看不见
   mergeFromDisk();
   // 复用会话时 claude 自己记着上文，再塞一遍等于同一段话付两遍钱，还会把前缀顶开后
   // 面的缓存。只有关掉 USE_SESSION 才回退到「自己拼历史」的老路子。
@@ -434,6 +434,16 @@ function buildPrompt(lines, chatKey) {
       for (const m of recent) {
         parts.push(`${m.role === 'assistant' ? '你' : '主人'}：${String(renderFaces(m.text)).slice(0, 600)}`);
       }
+    }
+  }
+  // 复用会话时 claude 只记得「自己在这个会话里说过的话」。那种绕开桥接、
+  // 直接由别的脚本发出去的消息（history 里带 ext: true），它一个字都不知道，
+  // 对方回一句「你刚发那个」它就会瞎猜。所以每轮把最近几条补进来。
+  if (USE_SESSION) {
+    const ext = history.filter((m) => m && m.ext && Number(m.ts) > Date.now() - EXT_ECHO_MS).slice(-6);
+    if (ext.length) {
+      parts.push('', '【你刚才主动发给对方、但不在这次会话里的话】这些确实已经发出去了，别当成没说过：');
+      for (const m of ext) parts.push(`· ${String(renderFaces(m.text)).slice(0, 400)}`);
     }
   }
   parts.push('', '主人刚发来：');
@@ -558,6 +568,8 @@ const SESSION_TURNS_MAX = 200;
 // 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十万 token 过一遍也慢。
 const SESSION_TOKENS_MAX = 100000;
 const SESSION_TTL_MS = 24 * 3600 * 1000;
+// 外部主动发出去的消息（history 里带 ext: true），多久之内的还补进 prompt。
+const EXT_ECHO_MS = 6 * 3600 * 1000;
 // 回滚开关：改成 false 就退回「每轮新进程 + 插件自己拼历史」，缓存也没了但一定跑得通。
 const USE_SESSION = true;
 
