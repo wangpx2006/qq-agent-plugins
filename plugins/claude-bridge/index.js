@@ -26,6 +26,8 @@ import path from 'node:path';
 import { Orchestrator } from '../../src/orchestrator.js';
 import { logger } from '../../src/logger.js';
 import { DATA_DIR } from '../../src/config.js';
+// 纯函数单独一份，能脱机自测（selftest.mjs）
+import { markImages, isPassReply, safeImageUrl } from './lib/pure.js';
 
 const PATCH_KEY = Symbol.for('qq-agent.claude-bridge.patch');
 const STATE_DIR = path.join(DATA_DIR, 'claude-bridge');
@@ -236,6 +238,11 @@ const MARK_HEAD = '@+[ \\t]*[_·]?[ \\t]*@+';
 const STICKER_RE = new RegExp(`${MARK_HEAD}\\s*表情\\s*[:：]\\s*([^@\\n]+?)\\s*@+`);
 const COLLECT_RE = new RegExp(`${MARK_HEAD}\\s*收藏\\s*[:：]\\s*([^@\\n]*)@*`);
 const INCOMING_DIR = path.join(STATE_DIR, 'incoming');
+// 图片大小上限：群图和私聊收到的图共用一个口子。
+// 2026-10-26 主人：「让群里的你也能看图」。原来卡 3MB，可 QQ 原图动辄五六兆
+// （实测一张 6.1MB 的街拍照直接被丢，群里只剩一个「[图片]」占位）。
+// Read 读 6MB 的 jpg 没问题，放到 12MB。
+const GROUP_MEDIA_MAX_BYTES = 12 * 1024 * 1024;
 
 function extractSticker(text) {
   const raw = String(text || '');
@@ -334,11 +341,13 @@ async function downloadIncoming(entry) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error('空文件');
+    if (buf.length > GROUP_MEDIA_MAX_BYTES) throw new Error(`${buf.length} 字节，超过上限 ${GROUP_MEDIA_MAX_BYTES}`);
     fs.mkdirSync(INCOMING_DIR, { recursive: true });
     const name = String(entry.mid ?? Date.now()).replace(/[^\w-]/g, '_');
     // 以前一律存 .img，Read 认不出扩展名就不当成图。按真实格式给名字。
     const dest = path.join(INCOMING_DIR, `${name}.${imageExt(buf, img?.file)}`);
     fs.writeFileSync(dest, buf);
+    pruneDir(INCOMING_DIR, GROUP_MEDIA_KEEP_MS);   // 私聊这份以前从不清理，会一直长
     return dest;
   } catch (error) {
     logger.warn('claude-bridge', `图片没下下来：${error?.message ?? error}`);
@@ -1213,11 +1222,15 @@ function groupSys() {
   ].join('\n');
 }
 
-// ── 语音：借 QQ 自己的语音转文字 ──────────────────────────────────────
-// 主人 2026-10-24 问「能不能直接用 qq 自带的语音转文字」。能——snowluma 实现了
-// NapCat 那套 `fetch_ptt_text`：把消息里的 record 段交给 QQ 自己的 pttTrans 接口，
-// 拿回腾讯转好的文字。不装 whisper、不转码、音频也不落地，代价只是走一次腾讯服务端。
-// ⚠️ 它的硬限制是「语音得还在本机缓存里」，所以收到就得转，不能等合并窗口过去再说。
+// ── 语音：核心先转，转不了再借 QQ 自己的转写兜底 ──────────────────────
+// 主路：核心 src/onebot.js 的 segmentsToText 遇到 record 段会找 `media.transcribe`
+// 提供者（voice-transcribe 注册的就是它），转成功的语音进来时已经是「[语音转文字] xxx」，
+// 压根不会走到这里 —— 只有本地识别没装、或者识别失败时才留下光秃秃的「[语音]」。
+// 兜底：这时候再问一次 QQ 自己的 pttTrans（snowluma 的 fetch_ptt_text）。
+// 代价是走一次腾讯服务端；语音得还在本机缓存里，所以收到就得转，不能等合并窗口过去。
+//
+// 2026-10-28 备注：一度以为这条路是死的（怀疑 message_id 是哈希串、Number() 得 NaN），
+// 实际查 data/sessions 里的记录，mid 是 `827771959` 这种真数字，Number 没问题 —— 留着。
 function onebotHttp() {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'config.json'), 'utf8'));
@@ -1241,8 +1254,7 @@ async function fetchVoiceText(mid) {
     });
     const j = await res.json();
     if (j?.status !== 'ok') {
-      // 2026-10-25：之前把失败整个吞了，群里只看到「没转出来」，查半天才知道
-      // 是腾讯服务端拒的（errCode 4294966146 之类）。原因留在这儿，下次一眼能看见。
+      // 失败原因留在这儿，下次一眼能看见（腾讯那边拒的时候只有 retcode）。
       logger.warn('claude-bridge', `语音转写被拒：retcode=${j?.retcode} ${String(j?.wording || j?.message || '').slice(0, 120)}`);
       return '';
     }
@@ -1261,25 +1273,8 @@ async function fetchVoiceText(mid) {
 // 模型手上有 Read，读本地图就能看见；不想看就不读，一分钱不花。
 // 注意别改成「自动 Read」——群里连发表情包会把 token 烧穿。
 const GROUP_MEDIA_DIR = path.join(STATE_DIR, 'media');
-// 2026-10-26 主人：「让群里的你也能看图」。
-// 原来卡 3MB，可 QQ 原图动辄五六兆（实测一张 6.1MB 的街拍照直接被丢，
-// 群里就只剩一个「[图片]」占位）。Read 读 6MB 的 jpg 没问题，放到 12MB。
-const GROUP_MEDIA_MAX_BYTES = 12 * 1024 * 1024;
 const GROUP_MEDIA_MAX_COUNT = 3;
 const GROUP_MEDIA_KEEP_MS = 24 * 3600 * 1000;
-
-/** 只放行公网 http(s)：群里谁能发消息，谁就能塞 url，别让它去戳本机或内网。 */
-function safeImageUrl(raw) {
-  try {
-    const u = new URL(String(raw));
-    if (!/^https?:$/.test(u.protocol)) return false;
-    const h = u.hostname.toLowerCase();
-    if (h === 'localhost' || h.endsWith('.local')) return false;
-    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h)) return false;
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
-    return true;
-  } catch { return false; }
-}
 
 function imageExt(buf, hint) {
   if (buf[0] === 0xff && buf[1] === 0xd8) return 'jpg';
@@ -1290,18 +1285,19 @@ function imageExt(buf, hint) {
   return m ? m[1].toLowerCase() : 'jpg';
 }
 
-/** 目录别无限长大：顺手把一天前的删掉。 */
-function pruneMediaDir() {
+/** 目录别无限长大：删掉超过 keepMs 的文件。群图和私聊收到的图共用这一套。 */
+function pruneDir(dir, keepMs) {
   try {
     const now = Date.now();
-    for (const n of fs.readdirSync(GROUP_MEDIA_DIR)) {
-      const p = path.join(GROUP_MEDIA_DIR, n);
+    for (const n of fs.readdirSync(dir)) {
+      const p = path.join(dir, n);
       try {
-        if (now - fs.statSync(p).mtimeMs > GROUP_MEDIA_KEEP_MS) fs.unlinkSync(p);
+        if (now - fs.statSync(p).mtimeMs > keepMs) fs.unlinkSync(p);
       } catch { /* 单个删不掉无所谓 */ }
     }
   } catch { /* 目录还没有就还没有 */ }
 }
+function pruneMediaDir() { pruneDir(GROUP_MEDIA_DIR, GROUP_MEDIA_KEEP_MS); }
 
 /**
  * 把一条消息里的图落地。
@@ -1310,13 +1306,16 @@ function pruneMediaDir() {
  */
 async function grabImages(entry) {
   const media = Array.isArray(entry?.media) ? entry.media : [];
-  const imgs = media
-    .filter((m) => m && m.kind === 'image' && safeImageUrl(m.url))
-    .slice(0, GROUP_MEDIA_MAX_COUNT);
+  const imgs = media.filter((m) => m && m.kind === 'image');
   if (!imgs.length) return [];
   try { fs.mkdirSync(GROUP_MEDIA_DIR, { recursive: true }); } catch { /* 建不了目录就放弃 */ }
-  const out = [];
-  for (const m of imgs) {
+  // 返回值和 imgs 一一对应，失败（地址被拦 / 下载出错 / 超限）的位置留 null。
+  // 以前失败就 continue 把数组压短，markImages 再按顺序填 —— 第 1 张失败时，
+  // 第 2 张的路径会被贴到第 1 个 [图片] 上，模型拿着错图说事（issue #3）。
+  const out = new Array(imgs.length).fill(null);
+  for (let i = 0; i < imgs.length && i < GROUP_MEDIA_MAX_COUNT; i++) {
+    const m = imgs[i];
+    if (!safeImageUrl(m.url)) continue;
     try {
       const res = await fetch(String(m.url), { signal: AbortSignal.timeout(20000) });
       if (!res.ok) { logger.warn('claude-bridge', `群图下载失败：HTTP ${res.status}`); continue; }
@@ -1327,23 +1326,11 @@ async function grabImages(entry) {
       }
       const file = path.join(GROUP_MEDIA_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${imageExt(buf, m.file)}`);
       fs.writeFileSync(file, buf);
-      out.push({ file, summary: String(m.summary || '').slice(0, 40), size: buf.length });
+      out[i] = { file, summary: String(m.summary || '').slice(0, 40), size: buf.length };
     } catch (e) { logger.warn('claude-bridge', `群图下载异常：${e?.message ?? e}`); }
   }
   pruneMediaDir();
   return out;
-}
-
-/** 把 `[图片]` 逐个换成带本地路径的说明；没下到的保持原样。 */
-function markImages(text, got) {
-  if (!got?.length) return text;
-  let i = 0;
-  return String(text).replace(/\[图片\]/g, () => {
-    const g = got[i++];
-    if (!g) return '[图片]';
-    const tag = g.summary ? `「${g.summary}」` : '';
-    return `[图片${tag}，本地文件：${g.file}]`;
-  });
 }
 
 let groupHistory = [];       // 跟私聊的 history 完全分开，不串味
@@ -1523,12 +1510,6 @@ function buildGroupPrompt(lines) {
   return parts.join('\n');
 }
 
-/** 模型判断这场不值得插嘴时会只回一个 PASS。别当话发出去。 */
-function isPassReply(parts) {
-  const flat = parts.join('').replace(/[^\p{L}]/gu, '');
-  return !flat || /^pass$/iu.test(flat);
-}
-
 async function groupFlush() {
   if (groupBusy || !groupBuffer.length) return;
   // 攒了几分钟再看时 buffer 可能很长，只取最后几条 —— 更早的都过时了，多带纯烧钱
@@ -1633,7 +1614,7 @@ function handleGroup(orch, chatKey, entry) {
     scheduleGroupFlush();
   };
 
-  // 语音要趁还在缓存里马上转；图也有时效（url 带 rkey），都是收到就先处理再去排队。
+  // 图有时效（url 带 rkey），语音得还在本机缓存里 —— 都是收到就先处理再去排队。
   const hasVoice = text.includes('[语音]') && entry?.mid != null;
   const hasImage = Array.isArray(entry?.media) && entry.media.some((m) => m && m.kind === 'image');
   if (!hasVoice && !hasImage) {
@@ -1646,9 +1627,10 @@ function handleGroup(orch, chatKey, entry) {
     hasImage ? grabImages(entry) : Promise.resolve([]),
     hasVoice ? fetchVoiceText(entry.mid) : Promise.resolve(''),
   ]).then(([got, spoken]) => {
-    if (got.length) {
+    const saved = got.filter(Boolean).length;
+    if (saved) {
       line.text = markImages(line.text, got);
-      logger.info('claude-bridge', `群里存下图（${name}，${got.length} 张）`);
+      logger.info('claude-bridge', `群里存下图（${name}，${saved} 张）`);
     } else if (hasImage) {
       logger.warn('claude-bridge', `群里的图没下下来（${name}），按 [图片] 占位处理`);
     }
@@ -1734,6 +1716,7 @@ function handle(orch, chatKey, entry) {
     scheduleFlush(Number(conf().debounceMs) || DEFAULT_DEBOUNCE_MS);
   };
   if (raw.includes('[语音]') && entry.mid != null) {
+    // 核心没转出来（没装本地识别，或者识别失败），再问一次 QQ 自己的转写
     fetchVoiceText(entry.mid).then((spoken) => {
       if (spoken) logger.info('claude-bridge', `私聊语音转成文字（${spoken.length} 字）`);
       pushLine(spoken ? raw.replace('[语音]', `[语音]说的是：${spoken}`) : raw);
