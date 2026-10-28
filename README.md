@@ -1,6 +1,6 @@
 # QQ-agent 外挂三件套
 
-给 [QQ-agent](https://github.com/Kondius/qq-agent)（MIT）加三个插件：
+给 [QQ-agent](https://github.com/K0nd1us/QQ-agent)（MIT）加三个插件：
 
 | 插件 | 解决什么 |
 | --- | --- |
@@ -124,4 +124,4 @@ pip install -r requirements.txt
 
 ## License
 
-MIT。三个插件是本仓库新增的代码；宿主程序 QQ-agent 由 Kondius 以 MIT 发布，本项目没有改动它的源码。
+MIT。三个插件是本仓库新增的代码；宿主程序 QQ-agent 由 [K0nd1us](https://github.com/K0nd1us) 以 MIT 发布，本项目没有改动它的源码。
