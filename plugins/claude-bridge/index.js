@@ -20,14 +20,19 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { Orchestrator } from '../../src/orchestrator.js';
 import { logger } from '../../src/logger.js';
 import { DATA_DIR } from '../../src/config.js';
 // 纯函数单独一份，能脱机自测（selftest.mjs）
-import { markImages, isPassReply, safeImageUrl } from './lib/pure.js';
+// 带 ?v= 是因为宿主的「热重载」只重新 import 了入口文件，相对 import 走 ESM 缓存，
+// 改 pure.js 不重启永远读到旧的那份（报「does not provide an export named ...」）。
+// 以后改 pure.js 记得把这个版本号往上推。
+import { markImages, isPassReply, safeImageUrl, isPrivateHost } from './lib/pure.js?v=20261028';
 
 const PATCH_KEY = Symbol.for('qq-agent.claude-bridge.patch');
 const STATE_DIR = path.join(DATA_DIR, 'claude-bridge');
@@ -189,6 +194,17 @@ function homeDir() {
   return os.homedir();
 }
 
+/**
+ * shell: true 时 cmd.exe 会按空格重新拆参数，路径里有空格就成两段。
+ * 用户名带空格、或者装在 C:\Program Files 下都会踩到（issue #4 A2）。
+ * 只给确实含特殊字符的参数加双引号，普通 flag 保持原样。
+ */
+function quoteArg(v) {
+  const s = String(v);
+  if (!/[\s"&|<>^()]/.test(s)) return s;
+  return `"${s.replace(/"/g, '\\"')}"`;
+}
+
 // ── 历史 ────────────────────────────────────────────────────────────
 function loadHistory() {
   try {
@@ -337,8 +353,7 @@ async function downloadIncoming(entry) {
   const url = String(img?.url || '');
   if (!/^https?:\/\//i.test(url)) return '';
   try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const res = await fetchImage(url, 20000);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error('空文件');
     if (buf.length > GROUP_MEDIA_MAX_BYTES) throw new Error(`${buf.length} 字节，超过上限 ${GROUP_MEDIA_MAX_BYTES}`);
@@ -677,6 +692,9 @@ function dropSession(key) {
   }
 }
 
+// --max-turns 是隐藏参数，CLI 哪天不认了就别再传（见 runClaude 里的注释）。
+let maxTurnsDropped = false;
+
 function runClaude(prompt, timeoutMs, options = {}) {
   return new Promise((resolve, reject) => {
     let child;
@@ -694,7 +712,29 @@ function runClaude(prompt, timeoutMs, options = {}) {
       // JSON，正文在 result 字段里；解析失败就退回原来的纯文本处理，不会因为
       // 版本差异把聊天弄哑。
       sess = options.sessionKey ? sessionFor(options.sessionKey) : null;
-      const args = ['-p', '--output-format', 'json', '--max-turns', options.maxTurns || MAX_TURNS, '--permission-mode', 'bypassPermissions'];
+
+      // 权限（2026-10-28 issue #1）：
+      // 私聊那个号只有主人自己用，权限全开 —— 后台跑没人能点「允许」，留默认模式等于工具全被拒。
+      // 群聊不一样：群里谁都能说话，而 Read 能读任意绝对路径，「凭据不给」原来只写在提示词里。
+      // 现在群聊改成默认权限模式 + 无人应答即拒，越界的默认结局是工具层直接拒掉
+      // （实测报「Path is outside allowed working directories」），不再靠模型自觉。
+      // ⚠️ 别把 Read/Grep/Glob 塞进 --allowedTools：实测一放行 Read，路径限制就一起没了。
+      const permArgs = options.group
+        ? ['--permission-mode', 'default', '--permission-prompts', 'none',
+           '--allowedTools', 'mcp__search__web_search,mcp__search__fetch_page']
+        : ['--permission-mode', 'bypassPermissions'];
+
+      // --max-turns 是隐藏参数（--help 里没有，当前版本却认）。哪天被移除，整条命令会直接报
+      // unknown option；这里见到一次就置位，后面不再传，别让每一轮都失败。
+      const turnArgs = maxTurnsDropped ? [] : ['--max-turns', String(options.maxTurns || MAX_TURNS)];
+
+      const args = ['-p', '--output-format', 'json', ...turnArgs, ...permArgs];
+
+      // 系统提示里的 cwd / 环境 / git 状态每轮都在变，会把缓存前缀打碎，挪到第一条 user 消息里。
+      // 只在用默认系统提示时生效（传了 --system-prompt-file 会被忽略，无害）。
+      args.push('--exclude-dynamic-system-prompt-sections');
+      // 自动压缩阈值跟 SESSION_TOKENS_MAX 对齐，别再靠外部环境变量（issue #4 B）。
+      args.push('--autocompact', `${Math.round(SESSION_TOKENS_MAX / 1000)}k`);
       if (sess) args.push(sess.resume ? '--resume' : '--session-id', sess.id);
       else args.push('--no-session-persistence');
 
@@ -734,10 +774,21 @@ function runClaude(prompt, timeoutMs, options = {}) {
         }
       } catch { /* 建不出来就照旧带上 MCP，顶多贵一点 */ }
 
-      child = spawn(claudeCmd(), args, {
+      // 群聊的「工作目录」就是允许它翻的那几个目录：cwd 给第一个，剩下的用 --add-dir 追加。
+      // 放在 args 最后是因为 --add-dir 是变长参数，后面不能再跟别的 flag。
+      let workCwd = options.cwd || homeDir();
+      if (options.group) {
+        const dirs = memoryDirs().filter((d) => {
+          try { return fs.statSync(d).isDirectory(); } catch { return false; }
+        });
+        workCwd = dirs[0] || STATE_DIR;
+        if (dirs.length > 1) args.push('--add-dir', ...dirs.slice(1));
+      }
+
+      child = spawn(quoteArg(claudeCmd()), args.map(quoteArg), {
         shell: true,
         windowsHide: true,
-        cwd: homeDir(),
+        cwd: workCwd,
         env: { ...process.env },
       });
     } catch (e) {
@@ -760,6 +811,12 @@ function runClaude(prompt, timeoutMs, options = {}) {
     const onClose = (code) => {
       clearTimeout(timer);
       const text = String(out || '').trim();
+
+      // 参数不认了要报得像参数不认了，别被兜底话术盖成「我这边卡了一下」。
+      if (!maxTurnsDropped && /unknown option|unrecognized option|Unknown argument/i.test(err + text)) {
+        maxTurnsDropped = true;
+        logger.warn('claude-bridge', '本机 CLI 不认 --max-turns 了，之后不再传这个参数');
+      }
 
       // --output-format json：正常返回就一行 JSON，正文在 result、token 数在 usage。
       // 顺手记一笔账，面板那边才看得见 QQ 里花的量。
@@ -1275,6 +1332,50 @@ async function fetchVoiceText(mid) {
 const GROUP_MEDIA_DIR = path.join(STATE_DIR, 'media');
 const GROUP_MEDIA_MAX_COUNT = 3;
 const GROUP_MEDIA_KEEP_MS = 24 * 3600 * 1000;
+const MEDIA_MAX_REDIRECTS = 3;
+
+/**
+ * 地址过一遍完整校验：协议、字面量 IP、DNS 解析后的 IP。
+ * 2026-10-28 issue #2：域名（比如 127.0.0.1.nip.io）光看字符串判不出来，得真解析。
+ * 解析之后再发请求存在 rebinding 的窗口，这里不做 pin-IP，代价太大，属于已知残余风险。
+ */
+async function checkImageUrl(raw) {
+  let u;
+  try { u = new URL(String(raw)); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  if (!safeImageUrl(u.href)) return null;
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (!net.isIP(host)) {
+    try {
+      const addrs = await dns.promises.lookup(host, { all: true });
+      if (!addrs.length || addrs.some((a) => isPrivateHost(a.address))) return null;
+    } catch { return null; }
+  }
+  return u;
+}
+
+/**
+ * 取图的唯一入口：手动跟重定向，每一跳都重新校验。
+ * 以前直接 fetch 默认 follow，第一跳是公网的图，第二跳 302 到 127.0.0.1 就进本机了。
+ */
+async function fetchImage(raw, timeoutMs) {
+  let cur = String(raw);
+  for (let hop = 0; hop <= MEDIA_MAX_REDIRECTS; hop++) {
+    const u = await checkImageUrl(cur);
+    if (!u) throw new Error(`不安全的地址，拒了：${String(cur).slice(0, 120)}`);
+    const res = await fetch(u.href, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) throw new Error(`重定向没给 location（HTTP ${res.status}）`);
+      try { await res.body?.cancel(); } catch { /* 断不断无所谓 */ }
+      cur = new URL(loc, u).href;
+      continue;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res;
+  }
+  throw new Error(`重定向超过 ${MEDIA_MAX_REDIRECTS} 跳`);
+}
 
 function imageExt(buf, hint) {
   if (buf[0] === 0xff && buf[1] === 0xd8) return 'jpg';
@@ -1317,8 +1418,7 @@ async function grabImages(entry) {
     const m = imgs[i];
     if (!safeImageUrl(m.url)) continue;
     try {
-      const res = await fetch(String(m.url), { signal: AbortSignal.timeout(20000) });
-      if (!res.ok) { logger.warn('claude-bridge', `群图下载失败：HTTP ${res.status}`); continue; }
+      const res = await fetchImage(String(m.url), 20000);
       const buf = Buffer.from(await res.arrayBuffer());
       if (!buf.length || buf.length > GROUP_MEDIA_MAX_BYTES) {
         logger.warn('claude-bridge', `群图跳过：${buf.length} 字节，上限 ${GROUP_MEDIA_MAX_BYTES}`);
@@ -1523,6 +1623,7 @@ async function groupFlush() {
       tools: GROUP_TOOLS,
       maxTurns: GROUP_MAX_TURNS,
       search: true,
+      group: true,          // 群聊走受限权限：工作目录外的读写由工具层直接拒（issue #1）
       chatKey: groupChatKey,
       sessionKey: groupChatKey,
     });

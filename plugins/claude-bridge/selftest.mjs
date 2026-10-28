@@ -39,19 +39,34 @@ check('正常文字要发', isPassReply(['好啊']), false);
 console.log('\n[3] safeImageUrl：公网放行、本机内网拦住');
 check('公网 https', safeImageUrl('https://multimedia.nt.qq.com.cn/x.jpg'), true);
 check('公网 http', safeImageUrl('http://example.com/a.png'), true);
+check('公网 IP', safeImageUrl('http://8.8.8.8/x.png'), true);
 check('127.0.0.1', safeImageUrl('http://127.0.0.1:6099/x'), false);
 check('localhost', safeImageUrl('http://localhost/x'), false);
 check('10.x', safeImageUrl('http://10.0.0.5/x'), false);
 check('192.168', safeImageUrl('http://192.168.1.2/x'), false);
 check('172.16', safeImageUrl('http://172.16.0.1/x'), false);
+check('172.32 是公网', safeImageUrl('http://172.32.0.1/x'), true);
 check('169.254', safeImageUrl('http://169.254.169.254/latest'), false);
+check('100.64 CGNAT', safeImageUrl('http://100.64.0.1/x'), false);
 check('非 http 协议', safeImageUrl('file:///C:/x.jpg'), false);
 
-// 已知未修（issue #2）：IPv6、十进制 IP、DNS 指向内网、重定向跳转都还没挡。
-// 这里只记录现状，别当通过 —— 改 issue #2 时把下面几条断言翻成 false。
-console.log('\n[4] 已知缺口（issue #2，未修，仅记录现状）');
-console.log(`  INFO  ${'http://[::1]/x'} -> ${safeImageUrl('http://[::1]/x')}`);
-console.log(`  INFO  ${'http://2130706433/x'} -> ${safeImageUrl('http://2130706433/x')}`);
+console.log('\n[4] IPv6 和非十进制写法（issue #2 修）');
+check('[::1]', safeImageUrl('http://[::1]/x'), false);
+check('[::]', safeImageUrl('http://[::]/x'), false);
+check('[::ffff:127.0.0.1]', safeImageUrl('http://[::ffff:127.0.0.1]/x'), false);
+check('[::ffff:7f00:1] 规范化写法', safeImageUrl('http://[::ffff:7f00:1]/x'), false);
+check('[fc00::1] ULA', safeImageUrl('http://[fc00::1]/x'), false);
+check('[fe80::1] 链路本地', safeImageUrl('http://[fe80::1]/x'), false);
+check('[ff02::1] 组播', safeImageUrl('http://[ff02::1]/x'), false);
+check('[2001:4860:4860::8888] 公网', safeImageUrl('http://[2001:4860:4860::8888]/x'), true);
+check('十进制 2130706433', safeImageUrl('http://2130706433/x'), false);
+check('十六进制 0x7f.0.0.1', safeImageUrl('http://0x7f.0.0.1/x'), false);
+check('八进制 0177.0.0.1', safeImageUrl('http://0177.0.0.1/x'), false);
+
+// 域名要看 DNS 才知道指哪，pure 层判不了 —— index.js 的 checkImageUrl 会 lookup 后再判。
+// 重定向也一样，fetchImage 是 redirect:'manual' 逐跳校验，这些没法脱机测。
+console.log('\n[5] pure 层判不了的（交给 DNS 和逐跳校验）');
+console.log(`  INFO  ${'127.0.0.1.nip.io'} 字面量判定 -> ${safeImageUrl('http://127.0.0.1.nip.io/x')}`);
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

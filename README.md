@@ -29,6 +29,7 @@
 - 只接自己在乎的话题，别人聊得热闹就听着（回 `PASS`，不发出去）；
 - 没 @ 它、话里也没带它的名字时，自己判断接不接；
 - 没有 shell、没有写文件权限，只有 `Read / Grep / Glob`；
+- 读取范围限制在 `memoryDirs` 这几个目录里，**越界是工具层直接拒**，不是靠提示词劝住；
 - 谁问密码、令牌、凭据都不给，包括熟人；能看图、能听语音，也能上网搜。
 
 ---
@@ -61,6 +62,16 @@
 ## 安装
 
 前提：QQ-agent 已经能正常收发消息。三个插件互相独立，可以只装其中一个。
+
+实测跑通的版本：
+
+| 组件 | 版本 |
+| --- | --- |
+| QQ-agent | 0.4.0 |
+| Claude Code CLI | 2.1.300、2.1.312 |
+| Node.js | 24.x |
+
+CLI 参数是隐藏的、会变的。`--max-turns` 在 `--help` 里不列但当前能用；万一哪天真的被删了，插件会认「unknown option」的报错，自动不再传这个参数，只是少一层轮数保险，不影响正常回话。
 
 1. 把 `plugins/` 下要用的目录**整个复制**到 QQ-agent 的 `plugins/` 目录里。
 2. 重启 QQ-agent（或用插件面板重新加载）。
@@ -110,7 +121,15 @@ pip install -r requirements.txt
 
 **Electron 起不来，先看看环境变量。** 如果 shell 里有 `ELECTRON_RUN_AS_NODE=1`，Electron 会当成 node 跑，报 `Cannot read properties of undefined (reading 'exports')`。启动前 `unset ELECTRON_RUN_AS_NODE`。
 
-**群聊永远不给 `Bash`。** 私聊那头只有主人一个人，权限全开无所谓；群里还有别人，给了 shell 等于把电脑交出去。要联网也只加「搜索 / 抓网页」这种窄 MCP，别为了省事把 `Bash` 塞进 `GROUP_TOOLS`。
+**群聊永远不给 `Bash`，而且这条得靠 CLI 拦，不能只写在提示词里。** 私聊那头只有主人一个人，`--permission-mode bypassPermissions` 全开无所谓；群里还有别人，给了 shell 等于把电脑交出去。群聊走的是 `--permission-mode default --permission-prompts none`，工作目录设在 `memoryDirs` 第一个目录上，读目录外的东西由**工具层直接拒**（`Path is outside allowed working directories`，会出现在 `permission_denials` 里）。
+
+这里有个坑：**`--allowedTools Read` 一放行，路径限制就一起失效了**，模型又能读到目录外。所以群聊的 `--allowedTools` 只列搜索类 MCP（`mcp__search__web_search,mcp__search__fetch_page`），绝不要往里加 `Read / Grep / Glob / Bash`。
+
+另外 `--settings` 里的 `permissions.deny` 规则**实测不生效**，别指望用 `deny: ["Read(...)"]` 堵住，只能靠上面这套 cwd + default 模式。
+
+**热重载不会重载依赖模块。** 宿主的重载只重新 `import` 入口 `index.js`，里面 `import './lib/pure.js'` 走的是 ESM 缓存 —— 改了 `lib/` 下的文件，重载会一直读到旧的那份，报 `does not provide an export named ...`。所以入口改成 `'./lib/pure.js?v=20261028'`，**以后改 `lib/` 里的东西记得把版本号往上推**，或者干脆重启应用。
+
+**改 `systemPromptFile` 之后当前会话不变。** 系统提示只在新建会话的第一轮塞进去，改完得等那个聊天换会话（超限、闲置、或手动清掉 `data/sessions/` 里对应的那条）才生效。急着看效果就换一个 `--session-id` 重开。
 
 **缓存不是自动的。** 每轮都 spawn 新进程的话，前缀永远对不上，`cache_read_input_tokens` 会一直是 0。要省 token 必须复用会话，见上面那节。
 
