@@ -397,18 +397,26 @@ function buildPrompt(lines, chatKey) {
   // ⚠️ 规则必须走 stdin 一起送进去，不能用 --append-system-prompt 从命令行传：
   //    spawn 是 shell:true，参数只做字符串拼接不做转义，SYS 里的空格会把它
   //    拆成十几个独立参数（claude 实际只收到「你现在在」四个字），规则全丢。
-  const parts = ['【主人给你定的固定规则，优先级最高，必须遵守】', sys()];
+  //
+  // 规矩和表情菜单都是常量，只在新建会话的那一轮塞一次。续会话时 claude 自己记得，
+  // 每轮再塞一遍等于每轮多付几千 token，而且都压在消息末尾、吃不到前缀缓存。
+  // 实测：私聊会话每轮固定多花 4400 token，二十来轮就被迫重开。
+  const firstTurn = !chatKey || !USE_SESSION || !sessionFor(chatKey).resume;
+  const parts = [];
+  if (firstTurn) {
+    parts.push('【主人给你定的固定规则，优先级最高，必须遵守】', sys());
 
-  const menu = stickerMenu();
-  if (menu) {
-    parts.push(
-      '',
-      '【表情】你手里有这些 QQ 收藏表情，格式是 id=它的样子：',
-      menu,
-      '想发表情就直接甩：在回复最后单独一行写 @@表情:id@@，插件会把它摘掉、单独发一张。' +
-        '一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，跟主人发微信一个样。' +
-        '同一张别连着两天用。',
-    );
+    const menu = stickerMenu();
+    if (menu) {
+      parts.push(
+        '',
+        '【表情】你手里有这些 QQ 收藏表情，格式是 id=它的样子：',
+        menu,
+        '想发表情就直接甩：在回复最后单独一行写 @@表情:id@@，插件会把它摘掉、单独发一张。' +
+          '一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，跟主人发微信一个样。' +
+          '同一张别连着两天用。',
+      );
+    }
   }
 
   parts.push('', `现在是 ${stamp()}。`);
@@ -416,7 +424,7 @@ function buildPrompt(lines, chatKey) {
   // 私聊印象：只在新会话的第一句塞进去。续会话时 claude 自己记得，再塞一遍
   // 就是每轮多付一次这笔钱，还会把那之后的内容从缓存前缀里踢出去。
   // 印象卡是别的模型定期提炼的，会过时、也会记错，所以只当参考，别当事实复述。
-  if (chatKey && (!USE_SESSION || !sessionFor(chatKey).resume)) {
+  if (chatKey && firstTurn) {
     const mine = loadImpressions(chatKey);
     if (mine) {
       parts.push('', '【你之前记下的主人的事】参考用，可能过时，别生硬地复述出来：', mine);
@@ -565,8 +573,12 @@ function recordUsage(parsed, chatKey) {
 // 隔 SESSION_TTL_MS 没说话。前者防上下文无限膨胀，后者防缓存早就过期了还在硬续。
 const SESSION_FILE = path.join(STATE_DIR, 'claude-sessions.json');
 const SESSION_TURNS_MAX = 200;
-// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十万 token 过一遍也慢。
-const SESSION_TOKENS_MAX = 100000;
+// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十二万 token 过一遍也慢。
+//
+// 这个数必须卡在 claude 自己的自动压缩阈值之前（settings 里的
+// CLAUDE_CODE_MAX_CONTEXT_TOKENS），否则历史会先被压成摘要，之前交代的规矩和
+// 印象全走样。按 131072 算，留 1 万左右余量给最后那一轮。
+const SESSION_TOKENS_MAX = 120000;
 const SESSION_TTL_MS = 24 * 3600 * 1000;
 // 外部主动发出去的消息（history 里带 ext: true），多久之内的还补进 prompt。
 const EXT_ECHO_MS = 6 * 3600 * 1000;
@@ -589,6 +601,28 @@ function saveSessions(map) {
     logger.warn('claude-bridge', `会话表存不下去：${e?.message ?? e}`);
   }
 }
+// ── 旧会话归档 ──────────────────────────────────────────────────────
+// 一个会话被换掉之后（token 超限、闲置太久、续不上），那份 jsonl 就再没人读了，
+// 却一直堆在 claude 的 projects 目录里，翻历史的时候越堆越长。换掉时把它挪进
+// DATA_DIR/archived-sessions，只搬不删，想找回来随时能搬。
+const ARCHIVE_DIR = path.join(DATA_DIR, 'archived-sessions');
+function archiveSession(id) {
+  if (!id) return;
+  try {
+    // claude 的目录名规则：工作目录里每个非字母数字字符都换成 -
+    const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
+    const projects = path.join(root, 'projects', homeDir().replace(/[^A-Za-z0-9]/g, '-'));
+    const src = path.join(projects, `${id}.jsonl`);
+    if (!fs.existsSync(src)) return;
+    fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+    fs.renameSync(src, path.join(ARCHIVE_DIR, `${id}.jsonl`));
+    logger.info('claude-bridge', `旧会话归档了：${String(id).slice(0, 8)}`);
+  } catch (e) {
+    // 正被 claude 进程占着、或者路径对不上：这轮搬不动就下轮再搬，绝不影响聊天
+    logger.warn('claude-bridge', `归档没成（不影响聊天）：${e?.message ?? e}`);
+  }
+}
+
 /** 这个聊天该用哪个会话。过期的当没有，返回新的。 */
 function sessionFor(key) {
   const rec = loadSessions()[key];
@@ -606,6 +640,7 @@ function markSession(key, id, promptTokens) {
   // 上下文已经撑得太长：这轮照常回完，下轮换个新会话从零起
   if (ctx > SESSION_TOKENS_MAX) {
     if (map[key]) {
+      archiveSession(map[key].id);
       delete map[key];
       saveSessions(map);
       logger.info('claude-bridge', `上下文 ${ctx} token，太长了，下一轮重开：${key}`);
@@ -613,6 +648,7 @@ function markSession(key, id, promptTokens) {
     return;
   }
   if (!map[key] || map[key].id !== id) {
+    if (map[key]?.id) archiveSession(map[key].id);   // 换新的了，旧的收起来
     map[key] = { id, createdAt: now, lastUsedAt: now, turns: 1, lastPromptTokens: ctx };
   } else {
     map[key].lastUsedAt = now;
@@ -625,6 +661,7 @@ function markSession(key, id, promptTokens) {
 function dropSession(key) {
   const map = loadSessions();
   if (map[key]) {
+    archiveSession(map[key].id);
     delete map[key];
     saveSessions(map);
     logger.info('claude-bridge', `会话续不上了，下一次重开：${key}`);
@@ -1435,7 +1472,9 @@ function loadImpressions(chatKey) {
 
 function buildGroupPrompt(lines) {
   const called = lines.some((l) => l.called);
-  const parts = ['【群聊，不是私聊。下面这些是硬规矩】', groupSys()];
+  // 群规矩也是常量，只在新建会话那一轮塞一次（每轮重塞的话，一天能涨十几万 token）
+  const firstTurn = !USE_SESSION || !sessionFor(groupChatKey).resume;
+  const parts = firstTurn ? ['【群聊，不是私聊。下面这些是硬规矩】', groupSys()] : [];
   // 印象卡是别的模型整理的，会过时也会记错，所以只说「参考」；更要紧的是别照着它
   // 主动往外说 —— 里面记着人家的账号糟心事、证件，群里说出来是要出事的。
   const impressions = loadImpressions(groupChatKey);
