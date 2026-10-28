@@ -1,11 +1,11 @@
 {
   "id": "claude-bridge",
   "name": "claude CLI 接线",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "apiVersion": 1,
   "category": "message",
   "entry": "index.js",
-  "description": "把指定的 QQ 私聊（和可选的群聊）交给本机的 claude CLI 回复，而不是让 QQ-agent 自带的模型回。\n\n【怎么用】\n· 在设置里填 ownerIds（接管谁的私聊）和 groupIds（要接管的群），空着就什么都不接管。\n· 私聊权限全开；群聊只给 Read/Grep/Glob，外加一个只含搜索的小 MCP。\n· 对方连发几条会等一会儿合并成一段再回，不会每条都单独回一次。\n· 对话存在 data\\claude-bridge\\history.json，私聊留 600 条、带进 prompt 的最近 80 条。\n· 想改回机器人原样：把 enabled 关掉，或者直接停用这个插件。\n\n【前提】本机装了 Claude Code 并且在 PATH 里能用 `claude` 命令。",
+  "description": "把指定的 QQ 私聊（和可选的群聊）交给本机的 claude CLI 回复，而不是让 QQ-agent 自带的模型回。\n\n【怎么用】\n· 在设置里填 ownerIds（接管谁的私聊）和 groupIds（要接管的群），空着就什么都不接管。\n· 私聊权限全开；群聊只给 Read/Grep/Glob，外加一个只含搜索的小 MCP，永远不给 shell。\n· 连发几条会等一会儿合并成一段再回，不会每条都单独回一次。\n\n【已带的功能】\n· 会话复用：同一个聊天续同一个 claude 会话，固定前缀走缓存，输入 token 能省七成以上（实测命中 75%~99%）。\n  上下文涨到 10 万 token、或闲置 8 小时，自动开新会话。\n· 用量记账：每轮 token 写进 data/sessions，面板的用量页能直接看。\n· 看图：私聊和群里的图会落地成本地文件，需要的时候用 Read 看一眼，不看就不花钱。\n· 语音：走 QQ 自己的转文字接口（snowluma 的 fetch_ptt_text），转不出来就照实说没听清。\n· 表情：认出 QQ 自带小表情和收藏表情包，能按名字接梗。\n· 记忆：私聊和群聊各有印象文件，新会话第一句自动带上。\n· 群聊：@ 到它、或者话里带它的名字才应声，没叫它就自己判断接不接。\n\n【前提】本机装了 Claude Code，并且能用 `claude` 命令。",
   "author": "",
   "enabledByDefault": false,
   "capabilities": [
@@ -20,7 +20,15 @@
     "botNames": [],
     "debounceMs": 7000,
     "timeoutMs": 300000,
-    "claudeCmd": ""
+    "claudeCmd": "",
+    "systemPromptFile": "",
+    "memoryDirs": [],
+    "searchMcp": "",
+    "searchNode": "",
+    "fetchFileScript": "",
+    "cronScript": "",
+    "cronTime": "",
+    "cronNode": ""
   },
   "configSchema": {
     "enabled": {
@@ -62,6 +70,46 @@
       "type": "string",
       "label": "claude 命令路径",
       "description": "留空就自动找 %USERPROFILE%\\AppData\\Roaming\\npm\\claude.cmd；装在别处时填完整路径。"
+    },
+    "systemPromptFile": {
+      "type": "string",
+      "label": "自定义系统提示文件",
+      "description": "填了就整段替换掉 CLI 默认的系统提示（--system-prompt-file）。留空用默认。"
+    },
+    "memoryDirs": {
+      "type": "array",
+      "label": "群里允许翻的目录",
+      "description": "群聊提示词里会告诉它这些路径有读权限。留空 = 插件自己的 data\\memory。"
+    },
+    "searchMcp": {
+      "type": "string",
+      "label": "搜索 MCP 脚本路径",
+      "description": "一个只提供 web_search / fetch_page 的 MCP 脚本。留空就按 ~/.claude/_mcp/search-mcp.js 猜，猜不到不挂搜索。"
+    },
+    "searchNode": {
+      "type": "string",
+      "label": "跑 MCP 用的 node",
+      "description": "留空会自动找 Program Files / 便携包里的 node.exe，再不行用 PATH 里的 node。"
+    },
+    "fetchFileScript": {
+      "type": "string",
+      "label": "取文件脚本路径",
+      "description": "QQ 的文件消息只带消息号。填一个「传消息号、打印本地路径」的脚本，它才能读别人发的文件。留空不提这条。"
+    },
+    "cronScript": {
+      "type": "string",
+      "label": "每天定时跑的脚本",
+      "description": "填绝对路径就启用，比如让机器每天自己去干一件活。留空 = 不启用。"
+    },
+    "cronTime": {
+      "type": "string",
+      "label": "定时时间（HH:MM）",
+      "description": "比如 20:00。到点后半小时内任一分钟触发都算；当天跑过就不再跑。"
+    },
+    "cronNode": {
+      "type": "string",
+      "label": "跑定时脚本的 node",
+      "description": "留空同「跑 MCP 用的 node」。"
     }
   },
   "prompt": null

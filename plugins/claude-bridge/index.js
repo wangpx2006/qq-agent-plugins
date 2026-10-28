@@ -11,13 +11,15 @@
 //   必经点，只有包它才能既吞掉消息、又拿到 this.sender。
 //
 // 安全边界：
-//   · 只认 private:<ownerIds 里的号>，群聊和别人的私聊一个字都不碰；
+//   · 私聊只认 ownerIds 里的号；群聊只认 groupIds 里的群，别的一律不碰；
+//   · 群聊永远只给 Read / Grep / Glob，外加一个只含搜索的 MCP，绝不给 shell；
 //   · 关掉插件 = 摘钩子、清定时器，不留监听；
 //   · 只在本机 spawn claude，不对外发任何请求。
 //
 // ⚠️ 应用自动更新可能覆盖 plugins/ 目录，届时把整个目录装回来即可（配置不受影响）。
 
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,92 +32,157 @@ const STATE_DIR = path.join(DATA_DIR, 'claude-bridge');
 const HISTORY_FILE = path.join(STATE_DIR, 'history.json');
 const STICKER_FILE = path.join(DATA_DIR, 'stickers.json');
 const EMPTY_MCP_FILE = path.join(STATE_DIR, 'empty-mcp.json');
+// 搜索走一个极小的 MCP：里面只有 web_search / fetch_page 两个工具。
+// 脚本路径和跑它的 node 都能在设置里填；留空就按常见位置猜，猜不到就不挂 MCP。
+const SEARCH_MCP_FILE = path.join(STATE_DIR, 'search-mcp.json');
+function searchMcpSrc() {
+  const fromConf = String(conf().searchMcp || '').trim();
+  if (fromConf) return fromConf;
+  const guess = path.join(os.homedir(), '.claude', '_mcp', 'search-mcp.js');
+  return fs.existsSync(guess) ? guess : '';
+}
+function searchNode() {
+  const fromConf = String(conf().searchNode || '').trim();
+  if (fromConf) return fromConf;
+  // 别用 process.execPath —— 主进程跑在 Electron 里时那个路径是 Electron 不是 node
+  const roots = [
+    path.join(os.homedir(), 'nodejs'),                                  // 便携版常见放法
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs'),
+  ];
+  for (const dir of roots) {
+    if (!dir) continue;
+    const direct = path.join(dir, 'node.exe');
+    if (fs.existsSync(direct)) return direct;
+    try {
+      // 有些便携包是 nodejs\<版本号>\node.exe
+      for (const sub of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!sub.isDirectory()) continue;
+        const p = path.join(dir, sub.name, 'node.exe');
+        if (fs.existsSync(p)) return p;
+      }
+    } catch { /* 这个目录没有就下一个 */ }
+  }
+  return 'node';
+}
 
 // 历史留多少：存着不花钱，只有带进 prompt 才计费。
 // 原先是 100/40，聊两小时前面的事就滚没了，所以放到 600/80。
 // 中文短句 200 条约 1 万 token，在 1M 窗口里连零头都算不上。
-const HISTORY_MAX = 600;         // 历史最多留 600 条（300 轮）—— 存着不花钱，只有带进 prompt 才计费
-const PROMPT_HISTORY = 80;       // 每次带进 prompt 的最近 80 条（40 轮）
-                                 // 带太多既费钱又容易答跑偏，只带最近这些
-// 回话前等几秒：对方经常一句话拆成几段发，4.5 秒太急、第二条还没打完就被打断。
+// ⚠️ 开了会话复用（USE_SESSION，见下面「会话复用」一节）之后，PROMPT_HISTORY 只在
+//    关掉复用时才用得上 —— 那时才由插件自己把历史拼进 prompt。
+const HISTORY_MAX = 600;         // 历史最多留 600 条（300 轮）
+const PROMPT_HISTORY = 80;       // 关掉会话复用时，每次带进 prompt 的最近 80 条（40 轮）
+// 回话前等几秒：主人经常一句话拆成几段发，4.5 秒太急、第二条还没打完就被打断。
 // 给到 7 秒起，宁可慢一点也别抢话。
 const DEFAULT_DEBOUNCE_MS = 7000;
 const DEFAULT_TIMEOUT_MS = 300000;
 const MAX_REPLY_CHARS = 900;
-// QQ 里干活只用得上这几个；每多一个工具，每次请求都要多付一份说明书
-const CHAT_TOOLS = 'Bash,Read,Write,Edit,Glob,Grep';
+// QQ 里干活只用得上这几个；每多一个工具，每次请求都要多付一份说明书。
+// 后面两个是搜索 MCP 的口子（只搜索、只抓网页，摸不到 shell）。
+const CHAT_TOOLS = 'Bash,Read,Write,Edit,Glob,Grep,mcp__search__web_search,mcp__search__fetch_page';
 
 const MAX_TURNS = '60';          // 要留出翻记忆/干活的圈数；设 1 会直接报 Reached max turns
-                                 // 圈数少了会直接报 Reached max turns，得留出翻记忆、干活的余量
 
-// ── 私聊语气规则 ────────────────────────────────────────────────────
-// 想让机器人说话不生硬，改这里就够了，不用换模型。
-// 关键在于别写「活泼一点」「像真人一点」这种形容词——模型理解不了；
-// 要写死能执行的东西：字数、禁止项、一条回几条、口头禅多久来一次。
-const SYS = [
-  '你现在在 QQ 上跟对方私聊，像同学之间发微信，不是客服也不是助手。',
+// 每次现算：里面要用到配置（比如取文件的脚本路径）。
+function sys() {
+  return [
+  '你现在在 QQ 上跟主人私聊，像同学之间发微信，不是客服也不是助手。',
   '这是即时聊天，不是写文档：口语，不要分点、不要加粗、不要 Markdown、不要小标题。',
   '说话要短，短到有点欠。多数时候 3~15 个字，两三个字也算一句，偶尔才有一句长的。',
   '句尾基本不打句号；问句用嘛、吗、呢收。少用冒号，一用就像写报告。',
   '口语词自然带点：嘛、咯、诶、啥、了啊、算了、也行。偶尔来一个，别每句都挂。',
   '想到什么就拆成几条发，一条一屏（1~4 条），每条单独一段、段与段之间空一行；别用分隔符、别编号。',
-  '不用每条都接满。对方说一句，回两三个字、或者直接甩张表情，都算回了。',
-  '不接对方的话茬也没关系，想说自己在意的那句就直接说。',
+  '不用每条都接满。主人说一句，回两三个字、或者直接甩张表情，都算回了。',
+  '不接主人的话茬也没关系，想说自己在意的那句就直接说。',
+  // 语音：交给 voice-transcribe 之类的插件先转成文字再进来，这里只负责让它「认账」。
+  // 不写这句，它会一口咬定自己听不见语音，对面发十条语音白搭。
+  '语音已经能转成文字了：带「[语音转文字] xxx」的就是主人原话，直接当他说的话接着聊，别再说自己听不见、也别说看不到语音。'
+    + '只有光秃秃一个「[语音]」才是没转成功，那时候才说没听清、让他打字。',
   '别总结、别升华、别列清单；也别问「吃饭了吗」「早点睡」这种，你不是管家。',
-  '不要提现在几点、别说「还不睡」「该睡了」「熬夜不好」。',
-  // 口头禅是要「主动带」的：压得太狠它整段一个都不带，读起来就很干。
-  '口头禅要主动带：几句里来一个，或者单甩一个也行。别句句挂，但别一整段一个都不带。',
-  // voice-transcribe 插件转出来的文本带这个前缀。
-  '语音已经能转成文字了：带「[语音转文字] xxx」的就是对方原话，直接当他说的话接着聊，'
-    + '别再说自己听不见、也别说看不到语音。只有光秃秃一个「[语音]」才是没转成功，'
-    + '那时候才说没听清、让他打字。',
-  // 「闷头试到超时」是这类机器人最常见的翻车方式：对面只看到你没回音。
+  '不要提现在几点、别说「还不睡」「该睡了」「熬夜不好」——主人几点睡不归你管。',
+  // 这条是「压太狠反而变干」的教训：口头禅得让它主动带，光说「少说」会一个都不说。
+  // 「喵」只是示例，换成你自己角色的那句话。别写「偶尔带点口头禅」——要写死是哪个词。
+  '「喵」要主动带：几句里来一个，或者单甩一个「喵」都行。别句句挂，但别一整段一个都不带。',
+  '你在这台电脑上有权限执行命令、读写文件。但删东西、改系统设置、往外边发东西这类收不回来的事，' +
+    '先跟主人说一声再动手，别自己拍板；日常查一查、看一眼、整理整理可以直接做。',
+  '装东西一律先报备：再小的也算（npm 包、扩展、命令行工具）。先说清它是什么、拿来干什么、装在哪多大、能不能卸干净，' +
+    '然后停下来等主人点头。他没明确说「装」就别装，别用「我先装上了」代替商量。',
+  // ── 下面这几条是「把你的某个固定流程写进 prompt」的写法示例，按需改写或删掉 ──
+  // 关键是把入口写成唯一一条死命令，并且交代「跑完立刻回话、别等它跑完」，
+  // 否则它会把五分钟超时全花在这上面，主人只看到没回音。
+  // '主人说「去吧」这类话，就跑这一条（原样，别改路径）："<解释器>" "<你的脚本>"' +
+  //   ' —— 它甩到后台自己跑完、自己把结果发出去。跑完立刻回一句就行，不要等它跑完。',
+  // 挂了搜索 MCP（plugin.json 里的 searchMcp）才有下面这句，没挂就自动省掉。
+  // 一句话点明「拿不准先搜、别硬编」比列一堆规则管用。
+  ...(searchMcpSrc() ? [
+    '要查资料、查实时信息，直接用 web_search 搜；想细看某条就 fetch_page 打开那一页。' +
+      '搜完用你自己的话说，别把搜索结果整段贴过来。' +
+      '问具体的片名、人名、最近发生的事这类，拿不准就先搜一下再答，' +
+      '别凭记忆硬编，也别一句「不知道」就完了。',
+  ] : []),
+  // 「它会现场瞎摸」是这类机器人最典型的翻车：不知道边界，摸两分钟撞上超时，
+  // 对面只看到「卡了」。给一份现成的速查表指路，并明说「表里没有就说没有」。
+  // '要动 QQ 本身（看谁在线、看别人资料、点赞、戳一戳、看群、改群名片），先读速查表照着跑：' +
+  //   '<你的 capabilities.md 路径> —— 里面有现成命令和动作表，别自己现场摸索。' +
+  //   '表里写着「没有」的，一句话说没有就完了，别硬试、也别编个理由圆场。',
+  // 同理：如果这台电脑上还挂着别的「身体」（模拟器、远程机、某个 App），
+  // 一定要在 prompt 里直说「你有一台 X、脚本在哪、怎么用」，否则它张口就说自己没有。
+  // '我有一台安卓模拟器：脚本是 node "<phone.mjs 路径>"，用法是 ui 拿坐标 → tap → shot 截图，' +
+  //   '截图用 Read 看得到（别拿截图目测坐标，一律用 ui 的 bounds）。' +
+  //   '我不是实时盯着屏幕，是一张一张截图看，所以动作要慢、每步截图确认。',
+  // 让它「读链接」也是一个道理：写死唯一入口，并允许它说读不到。
+  // '主人甩来链接，先跑 node "<你的读链接脚本>" "<链接>"，别凭标题猜内容；' +
+  //   '消息里出现「[卡片消息]」说明是分享卡片，标题和链接排在它后面，把链接挑出来照样跑。' +
+  //   '读不到就照实说读不到，别装作看过。',
+  '主人说「你自己弄」「你操作电脑去」就是让我动手，不是让我反过来问他要怎么弄。',
+  // 「发文件过来读不了」几乎必踩：文件消息里只有文件名和消息号，没有内容本体。
+  // 得先把它下到本地，再 Read。一次就够，别反复试同一份。
+  '主人发文件过来，消息长这样：[文件xxx.md]（消息号 123）。' +
+    (fetchFileScript()
+      ? `跑 node "${fetchFileScript()}" 123，它会打印本地路径，再用 Read 读那个路径。`
+      : '先想办法把它下到本地，再用 Read 读。') +
+    '打印出来 ok:false 就照里面的原因说（过期了就让主人重发），别自己编文件内容。',
   '拿不准的事别闷头试到超时——试满五分钟，对面看到的是「没回音」，比说句「这个我得看看」难看得多。摸两下没头绪就先回话。',
-  '不知道就说不知道，别编。',
+  '绝对不要在 QQ 里重启 QQ-agent 自己，那是把自己关机，对面会干等好几分钟。要重启就说一声，让主人在电脑上点。',
+  '搜过还是不知道，就说不知道，别编。',
   '直接说回复内容，不要说「我：」这种前缀，也不要解释你为什么这么拆。',
-  // ── 下面是「允许它操作电脑」才需要的，纯聊天机器人可以整段删掉 ──────────
-  '你有权限执行命令、读写文件。但删东西、改系统设置、往外边发东西这类收不回来的事，'
-    + '先说一声再动手，别自己拍板；日常查一查、看一眼、整理整理可以直接做。',
-  '装东西一律先报备：再小的也算。先说清它是什么、拿来干什么、装在哪多大、能不能卸干净，'
-    + '然后停下来等对方点头。他没明确说「装」就别装，别用「我先装上了」代替商量。',
-  // 下面几条是「把某种能力写进 prompt」的写法示例，按你的实际情况改写或删掉：
-  // · 查资料：写死一个唯一入口，否则它要么拿 curl 瞎抓、要么凭印象编。
-  //   '要查实时信息，一律先走本机这个脚本：① 用 Write 把查询词写进 <词文件路径>；'
-  //     + '② 跑 python -I "<脚本路径>" -f "<词文件路径>" -n 5。中文别直接塞命令行，会变 GBK 乱码。'
-  // · 能力速查表：它不知道边界就会现场瞎摸，摸两分钟撞上超时。
-  //   '要动 <某个 App>，先读 <速查表路径> 照着跑；表里写着「没有」的，一句话说没有就完了，别硬试。'
-  // · 读分享链接：'甩来链接先用 <脚本> 读，别凭标题猜内容；读不到就照实说读不到，别装作看过。'
-  // · 收文件：'文件消息只带文件名和消息号，得先跑 <脚本> 下到本地再 Read。'
-  // · 别自杀：'绝对不要在聊天里重启你自己，那是把自己关机。要重启就说一声，让对方去点。'
-].join('');
+  ].join('');
+}
 
 let api = null;
 let history = [];
 let buffer = [];            // 还没合并进 prompt 的入站文本
 let debounceTimer = null;
 let busy = false;
-let pendingImage = null;    // 用户发来、还没看的图 { entry, chatKey }
+let pendingImage = null;    // 主人发来、还没看的图 { entry, chatKey }
 
 // ── 配置 ────────────────────────────────────────────────────────────
 function conf() {
   return (api && typeof api.config === 'function' && api.config()) || {};
 }
 
+// 取文件脚本（plugin.json 的 fetchFileScript）：QQ 的文件消息只带消息号，
+// 得靠外部脚本把内容下到本地。留空就不提这条，免得提示词里出现空路径。
+function fetchFileScript() {
+  return String(conf().fetchFileScript || '').trim();
+}
+
 function ownerIds() {
   const raw = conf().ownerIds;
   const list = Array.isArray(raw) ? raw : String(raw || '').split(/[,，\s]+/);
   const out = list.map((v) => String(v).trim()).filter(Boolean);
-  return out;   // 没配就谁都不接管，别乱回
+  return out;
 }
 
 function claudeCmd() {
   const fromConf = String(conf().claudeCmd || '').trim();
   if (fromConf) return fromConf;
-  const home = os.homedir();
-  const guess = path.join(home, 'AppData', 'Roaming', 'npm', 'claude.cmd');
+  const guess = path.join(homeDir(), 'AppData', 'Roaming', 'npm', 'claude.cmd');
   return fs.existsSync(guess) ? guess : 'claude';
 }
 
+// 用户主目录：不写死任何人的路径，跟着当前跑起来的环境走。
 function homeDir() {
   return os.homedir();
 }
@@ -130,10 +197,10 @@ function loadHistory() {
   }
 }
 
-/** 别处（定时脚本、外部程序）也可能往这个文件追加。
+/** 外面的脚本（每日学习 learn.js、日报 digest.js、我在 VS Code 发的 say.mjs）也往这个文件追加。
  *  内存里这份只在启动时读过，直接整份覆盖写会把它们全抹掉——
- *  踩过坑：刚聊的那几条被覆盖冲没，模型只能顺着旧话题瞎猜，越聊越离谱。
- *  所以写之前必须先和磁盘对一次。 */
+ *  2026-10-24 栽得最惨的一次：主人在 QQ 问「第二个没看懂」，我回的四条解释被覆盖冲没了，
+ *  它只能顺着旧话题瞎猜，越聊越离谱。所以写之前必须先和磁盘对一次。 */
 function mergeFromDisk() {
   try {
     const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
@@ -163,8 +230,8 @@ function saveHistory() {
 // 原版机器人是靠 send_sticker 工具发的，桥接把私聊整条截走了，那条路就断了。
 // 现在改成：模型在回复最后单独写一行 `@@表情:<id>@@`，这边摘出来单独发一张。
 // 标记两头不能只认 @@：模型有时会把开头写成 @_@ 或 @ @（当成颜文字理解），
-// 漏一个就会把一整串「@_@表情:collected_1296918157@@」原样发进 QQ，
-// 看着跟乱码一样。所以两头都放宽。
+// 2026-10-24 主人就在 QQ 上看到一整串「@_@表情:collected_1296918157@@」原样发过去，
+// 看着跟乱码一样，他还回了个「？」。所以两头都放宽。
 const MARK_HEAD = '@+[ \\t]*[_·]?[ \\t]*@+';
 const STICKER_RE = new RegExp(`${MARK_HEAD}\\s*表情\\s*[:：]\\s*([^@\\n]+?)\\s*@+`);
 const COLLECT_RE = new RegExp(`${MARK_HEAD}\\s*收藏\\s*[:：]\\s*([^@\\n]*)@*`);
@@ -178,13 +245,55 @@ function extractSticker(text) {
 }
 
 /** 最后一道闸：万一标记没被认出来（写成别的花样、或者被截断），
- *  宁可整段刮掉也不能原样发出去。用户看到的「乱码」十次有九次是这种漏网的内部标记。 */
+ *  宁可整段刮掉也不能原样发出去。主人看到的「乱码」十次有九次是这种漏网的内部标记。 */
 function scrubMarks(text) {
   return String(text || '')
     // @ 和「表情/收藏/贴纸」之间不许夹别的字：`@老王 表情:笑` 这种正常句子刮不到
     .replace(/@+[ \t]*[_·]?[ \t]*@*[ \t]*(?:表情|收藏|贴纸)[ \t]*[:：]?[ \t]*[^\s@]*[ \t]*@*/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+// ── QQ 小表情编号 → 官方名 ──────────────────────────────────────────
+// 2026-10-28 主人下了一个 qq-face 技能，想让我看懂 [表情182]。
+// 但私聊和群聊都走 claude-bridge → claude CLI：那个技能是给 QQ-agent 自己的
+// tool-registry 用的，注册的 qq-face__lookup 进不了这边的 --tools 白名单，
+// promptSections 也拼不进这边自己写的 prompt，装了等于白装。
+// 改成在这边直接翻译：正文里 [表情182] → [表情182·笑哭]，模型一眼就懂，零工具调用。
+// 目录是协议端缓存里那 398 条；文件不在就原样留着编号，不影响说话。
+const FACE_CATALOG_FILE = path.join(path.dirname(DATA_DIR), 'snowluma', 'data', 'sys-face-catalog.json');
+let faceMapCache = null;          // null=还没读过；Map=读到了；false=读不到，别再反复试
+function faceMap() {
+  if (faceMapCache !== null) return faceMapCache || null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(FACE_CATALOG_FILE, 'utf8'));
+    const map = new Map();
+    for (const pack of raw?.packs || []) {
+      for (const e of pack?.emojis || []) {
+        const id = String(e?.qSid ?? '').trim();
+        const name = String(e?.qDes ?? '').replace(/^\//, '').trim();
+        if (id && name && !map.has(id)) map.set(id, name);
+      }
+    }
+    faceMapCache = map.size ? map : false;
+    if (map.size) logger.info('claude-bridge', `表情目录读到 ${map.size} 条`);
+  } catch (error) {
+    faceMapCache = false;
+    logger.warn('claude-bridge', `表情目录读不出来：${error?.message ?? error}`);
+  }
+  return faceMapCache || null;
+}
+
+/** 把正文里的 [表情182] 换成 [表情182·笑哭]；查不到的编号原样保留。 */
+function renderFaces(text) {
+  const s = String(text ?? '');
+  if (!s.includes('[表情')) return s;
+  const map = faceMap();
+  if (!map) return s;
+  return s.replace(/\[表情(\d+)\]/g, (all, id) => {
+    const name = map.get(id);
+    return name ? `[表情${id}·${name}]` : all;
+  });
 }
 
 /** 读表情库，生成「id=描述」的一行清单；读不到就返回空串。 */
@@ -203,7 +312,7 @@ function stickerMenu() {
   }
 }
 
-// ── 用户发来的图 ────────────────────────────────────────────────────
+// ── 主人发来的图 ────────────────────────────────────────────────────
 function imageOf(entry) {
   const media = Array.isArray(entry?.media) ? entry.media : [];
   return media.find((m) => m && m.kind === 'image' && (m.url || m.file)) || null;
@@ -215,7 +324,7 @@ function isOwnerImage(chatKey, entry) {
   return !!imageOf(entry);
 }
 
-/** 把用户发来的图落到本地，好让 claude 用 Read 看一眼。拿不到就返回空串。 */
+/** 把主人发来的图落到本地，好让 claude 用 Read 看一眼。拿不到就返回空串。 */
 async function downloadIncoming(entry) {
   const img = imageOf(entry);
   const url = String(img?.url || '');
@@ -238,14 +347,14 @@ async function downloadIncoming(entry) {
 }
 
 function buildImagePrompt(localPath, caption) {
-  const parts = ['【用户给你定的固定规则，优先级最高，必须遵守】', SYS, '', `现在是 ${stamp()}。`, ''];
-  parts.push(`用户刚在 QQ 私聊发来一张图片${caption ? `，附言「${caption}」` : ''}。`);
+  const parts = ['【主人给你定的固定规则，优先级最高，必须遵守】', sys(), '', `现在是 ${stamp()}。`, ''];
+  parts.push(`主人刚在 QQ 私聊发来一张图片${caption ? `，附言「${renderFaces(caption)}」` : ''}。`);
   parts.push(localPath
     ? `图片已存到本地：${localPath}。先用 Read 看一眼它是什么。`
     : '这次没取到图片文件，只能凭附言判断，拿不准就别收。');
   parts.push(
     '',
-    '用户发的图，你看见就行了，不用描述图里有什么、也不用复述画面。',
+    '主人发的图，你看见就行了，不用描述图里有什么、也不用复述画面。',
     '是表情包、梗图 → 在回复最后单独一行写 @@收藏:一句简短备注@@ 存进库里，收这件事一个字都别提，不用说「收了」，也别道谢。',
     '是照片、截图、学习资料、随手拍 → 不写 @@收藏@@，按内容接一句很短的话就行。',
     '别复述图上的字、别解释画面是什么样，最多顺着它的意思接一句。',
@@ -284,11 +393,11 @@ function stamp() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-function buildPrompt(lines) {
+function buildPrompt(lines, chatKey) {
   // ⚠️ 规则必须走 stdin 一起送进去，不能用 --append-system-prompt 从命令行传：
   //    spawn 是 shell:true，参数只做字符串拼接不做转义，SYS 里的空格会把它
   //    拆成十几个独立参数（claude 实际只收到「你现在在」四个字），规则全丢。
-  const parts = ['【用户给你定的固定规则，优先级最高，必须遵守】', SYS];
+  const parts = ['【主人给你定的固定规则，优先级最高，必须遵守】', sys()];
 
   const menu = stickerMenu();
   if (menu) {
@@ -297,39 +406,249 @@ function buildPrompt(lines) {
       '【表情】你手里有这些 QQ 收藏表情，格式是 id=它的样子：',
       menu,
       '想发表情就直接甩：在回复最后单独一行写 @@表情:id@@，插件会把它摘掉、单独发一张。' +
-        '一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，跟用户发微信一个样。' +
+        '一条回复最多一张，但用得可以勤——吐槽、无奈、开心、懒得打字的时候都发，跟主人发微信一个样。' +
         '同一张别连着两天用。',
     );
   }
 
   parts.push('', `现在是 ${stamp()}。`);
-  // 回复前先把外面写的并进来，否则别处追加的内容它根本看不见
-  mergeFromDisk();
-  const recent = history.slice(-PROMPT_HISTORY);
-  if (recent.length) {
-    parts.push('', '你们刚才聊的：');
-    for (const m of recent) {
-      parts.push(`${m.role === 'assistant' ? '你' : '用户'}：${String(m.text).slice(0, 600)}`);
+
+  // 私聊印象：只在新会话的第一句塞进去。续会话时 claude 自己记得，再塞一遍
+  // 就是每轮多付一次这笔钱，还会把那之后的内容从缓存前缀里踢出去。
+  // 印象卡是别的模型定期提炼的，会过时、也会记错，所以只当参考，别当事实复述。
+  if (chatKey && (!USE_SESSION || !sessionFor(chatKey).resume)) {
+    const mine = loadImpressions(chatKey);
+    if (mine) {
+      parts.push('', '【你之前记下的主人的事】参考用，可能过时，别生硬地复述出来：', mine);
     }
   }
-  parts.push('', '用户刚发来：');
-  for (const l of lines) parts.push(`用户：${l}`);
+
+  // 回复前先把外面写的并进来，否则我发的学习内容、日报它根本看不见（2026-10-24 连栽两次）
+  mergeFromDisk();
+  // 复用会话时 claude 自己记着上文，再塞一遍等于同一段话付两遍钱，还会把前缀顶开后
+  // 面的缓存。只有关掉 USE_SESSION 才回退到「自己拼历史」的老路子。
+  if (!USE_SESSION) {
+    const recent = history.slice(-PROMPT_HISTORY);
+    if (recent.length) {
+      parts.push('', '你们刚才聊的：');
+      for (const m of recent) {
+        parts.push(`${m.role === 'assistant' ? '你' : '主人'}：${String(renderFaces(m.text)).slice(0, 600)}`);
+      }
+    }
+  }
+  parts.push('', '主人刚发来：');
+  for (const l of lines) parts.push(`主人：${renderFaces(l)}`);
   parts.push('', '回这一条。');
   return parts.join('\n');
 }
 
 // ── 调 claude ───────────────────────────────────────────────────────
+// ── 用量记账 ────────────────────────────────────────────────────────
+// 2026-10-28 主人问「能不能把 QQ 里的 token 用量放进面板」。
+// 面板只认 data/sessions/*.json 里 messages[].raw.usage（解析在 src/app.js 的
+// parseUsageSessionFile）。可这边把消息整个吞了，QQ-agent 自己压根不建会话，
+// 所以用量页永远显示 0 次、0 token。
+// 现在每轮 claude 调用结束，把 usage 追加进一个同格式的文件，面板自己就扫得到。
+// 钱不用我们算 —— 面板拿 token 数按 model-prices 的价目表推。
+const USAGE_DIR = path.join(DATA_DIR, 'sessions');
+function usageDayKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// DeepSeek 官方分时价（2026-09-10 起）：北京时间周一至周五 9:00–12:00、14:00–18:00
+// 高峰，价格翻倍；其余时段含周末、法定节假日全天按闲时价。
+// 跟 src/model-prices.js 的 PEAK_WINDOWS / PEAK_TZ_OFFSET_HOURS 是一套口径，
+// 插件是独立文件不能 import，所以在这儿抄一份。法定节假日面板也没认，两边一致。
+const PEAK_WINDOWS = [[9, 12], [14, 18]];
+const PEAK_TZ_OFFSET = 8;
+function isPeakNow(ts) {
+  const d = new Date(Number(ts) || Date.now());
+  const wd = d.getUTCDay();
+  if (wd === 0 || wd === 6) return false;
+  const h = (d.getUTCHours() + PEAK_TZ_OFFSET) % 24;
+  return PEAK_WINDOWS.some(([from, to]) => h >= from && h < to);
+}
+function recordUsage(parsed, chatKey) {
+  try {
+    const u = parsed?.usage || {};
+    // 面板口径：prompt_tokens 要含缓存读写，cached_tokens 单独算命中率
+    const prompt = (Number(u.input_tokens) || 0)
+      + (Number(u.cache_read_input_tokens) || 0)
+      + (Number(u.cache_creation_input_tokens) || 0);
+    const completion = Number(u.output_tokens) || 0;
+    if (!prompt && !completion) return;
+    const model = Object.keys(parsed.modelUsage || {})[0] || 'deepseek-flash';
+    const now = Date.now();
+    const tag = String(chatKey || 'unknown').replace(/[^\w.-]+/g, '_');
+    const file = path.join(USAGE_DIR, `bridge-${tag}-${usageDayKey(now)}.json`);
+    let data = {
+      id: `claude-bridge-${tag}`, chatKey: String(chatKey || 'unknown'),
+      vendor: 'api.deepseek.com', model, startedAt: now, webSearchCount: 0, messages: [],
+    };
+    try {
+      const old = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (old && Array.isArray(old.messages)) data = old;
+    } catch { /* 当天的文件还没有，正常 */ }
+    data.startedAt = Number(data.startedAt) || now;
+    data.model = data.model || model;
+    data.messages.push({
+      raw: {
+        usage: {
+          prompt_tokens: prompt,
+          completion_tokens: completion,
+          prompt_tokens_details: { cached_tokens: Number(u.cache_read_input_tokens) || 0 },
+        },
+        created: Math.floor(now / 1000),
+        model,
+      },
+    });
+    data.webSearchCount = (Number(data.webSearchCount) || 0) + (Number(u.server_tool_use?.web_search_requests) || 0);
+    data.messages = data.messages.slice(-2000);
+    fs.mkdirSync(USAGE_DIR, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 1), 'utf8');
+    fs.renameSync(tmp, file);
+
+    // 顶栏那句「今日 N 次运行 · Tok」不读档案，只读 usage-today.json，
+    // 所以这里再累一笔，不然上面记了下面还是 0。
+    // 撞车概率极小（桥接把消息吞了，QQ-agent 自己基本不跑会话），万一撞上也就少记一次。
+    try {
+      const todayFile = path.join(DATA_DIR, 'usage-today.json');
+      const dayKey = usageDayKey(now);
+      let today = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, runs: 0, webSearchCount: 0 };
+      try {
+        const oldToday = JSON.parse(fs.readFileSync(todayFile, 'utf8'));
+        if (oldToday?.dayKey === dayKey) today = oldToday;
+      } catch { /* 新的一天 */ }
+      today.promptTokens = (Number(today.promptTokens) || 0) + prompt;
+      today.completionTokens = (Number(today.completionTokens) || 0) + completion;
+      today.totalTokens = (Number(today.totalTokens) || 0) + prompt + completion;
+      today.cachedTokens = (Number(today.cachedTokens) || 0) + (Number(u.cache_read_input_tokens) || 0);
+      today.runs = (Number(today.runs) || 0) + 1;
+      today.webSearchCount = (Number(today.webSearchCount) || 0) + (Number(u.server_tool_use?.web_search_requests) || 0);
+
+      // 峰谷分账：顶栏「今日成本」原来拿总 token × 闲时价，高峰时段跑会少算一半。
+      // 这里按调用那一刻归桶，顶栏就能两档价分别算。
+      const peak = isPeakNow(now);
+      const b = peak ? 'peak' : 'offPeak';
+      today[`${b}PromptTokens`] = (Number(today[`${b}PromptTokens`]) || 0) + prompt;
+      today[`${b}CompletionTokens`] = (Number(today[`${b}CompletionTokens`]) || 0) + completion;
+      today[`${b}CachedTokens`] = (Number(today[`${b}CachedTokens`]) || 0) + (Number(u.cache_read_input_tokens) || 0);
+      today[`${b}Runs`] = (Number(today[`${b}Runs`]) || 0) + 1;
+      const tmpToday = `${todayFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmpToday, JSON.stringify(today), 'utf8');
+      fs.renameSync(tmpToday, todayFile);
+    } catch { /* 顶栏少记一次不影响聊天 */ }
+  } catch (error) {
+    logger.warn('claude-bridge', `用量没记上：${error?.message ?? error}`);
+  }
+}
+
+// ── 会话复用（吃缓存）─────────────────────────────────────────────────
+// 2026-10-28 主人问「QQ 里缓存一直是 0？」。查明：每轮都 spawn 一个新进程，
+// 十几 k 的系统提示和工具定义每次全价重算。改成每个聊天固定一个 claude 会话，
+// 之后 --resume 接着聊 —— 前缀全走缓存。实测同一会话第二次调用：
+// 20,569 输入里 20,352 命中缓存，成本降到三十分之一。
+//
+// 私聊一个、每个群一个。两个重置条件：聊够 SESSION_TURNS_MAX 轮，或者
+// 隔 SESSION_TTL_MS 没说话。前者防上下文无限膨胀，后者防缓存早就过期了还在硬续。
+const SESSION_FILE = path.join(STATE_DIR, 'claude-sessions.json');
+const SESSION_TURNS_MAX = 200;
+// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十万 token 过一遍也慢。
+const SESSION_TOKENS_MAX = 100000;
+const SESSION_TTL_MS = 8 * 3600 * 1000;
+// 回滚开关：改成 false 就退回「每轮新进程 + 插件自己拼历史」，缓存也没了但一定跑得通。
+const USE_SESSION = true;
+
+function loadSessions() {
+  try {
+    const d = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+    return d && typeof d === 'object' ? d : {};
+  } catch { return {}; }
+}
+function saveSessions(map) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    const tmp = `${SESSION_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(map, null, 1), 'utf8');
+    fs.renameSync(tmp, SESSION_FILE);
+  } catch (e) {
+    logger.warn('claude-bridge', `会话表存不下去：${e?.message ?? e}`);
+  }
+}
+/** 这个聊天该用哪个会话。过期的当没有，返回新的。 */
+function sessionFor(key) {
+  const rec = loadSessions()[key];
+  const now = Date.now();
+  const fresh = rec && rec.id
+    && now - Number(rec.lastUsedAt || 0) < SESSION_TTL_MS
+    && Number(rec.turns || 0) < SESSION_TURNS_MAX;
+  return fresh ? { id: rec.id, resume: true } : { id: randomUUID(), resume: false };
+}
+/** 这轮成功了：记一笔轮数。会话换了（重置）就重新计数。 */
+function markSession(key, id, promptTokens) {
+  const map = loadSessions();
+  const now = Date.now();
+  const ctx = Number(promptTokens) || 0;
+  // 上下文已经撑得太长：这轮照常回完，下轮换个新会话从零起
+  if (ctx > SESSION_TOKENS_MAX) {
+    if (map[key]) {
+      delete map[key];
+      saveSessions(map);
+      logger.info('claude-bridge', `上下文 ${ctx} token，太长了，下一轮重开：${key}`);
+    }
+    return;
+  }
+  if (!map[key] || map[key].id !== id) {
+    map[key] = { id, createdAt: now, lastUsedAt: now, turns: 1, lastPromptTokens: ctx };
+  } else {
+    map[key].lastUsedAt = now;
+    map[key].turns = Number(map[key].turns || 0) + 1;
+    map[key].lastPromptTokens = ctx;
+  }
+  saveSessions(map);
+}
+/** resume 找不到会话时把它扔掉，下一轮自动新建。 */
+function dropSession(key) {
+  const map = loadSessions();
+  if (map[key]) {
+    delete map[key];
+    saveSessions(map);
+    logger.info('claude-bridge', `会话续不上了，下一次重开：${key}`);
+  }
+}
+
 function runClaude(prompt, timeoutMs, options = {}) {
   return new Promise((resolve, reject) => {
     let child;
+    // 声明在 try 外面：close 回调里要用它判断「这轮是不是续会话」。
+    let sess = null;
     try {
-      // 私聊那头只有主人一个人，所以权限全开；群聊另走一份只读名单。
+      // 主人 2026-10-24 拍板：这个号只有他自己用，权限全给。
       // --permission-mode bypassPermissions 是必需的 —— 后台跑没人能点"允许"，
       // 留着默认模式等于所有工具都被静默拒绝。
-      // --no-session-persistence：聊天的上下文插件自己存在 history.json 里，
-      // 不需要 claude 那边再落一份 —— 不然每说一句就多一个会话，列表全是碎片。
+      // --session-id / --resume：同一聊天复用同一个会话，系统提示和工具定义
+      // 十几 k 的固定前缀就全走缓存了（见上面「会话复用」那段的实测）。
+      // 没有 sessionKey 的调用（理论上不该有）才退回一次性模式。
       // 命令行上只留纯 ASCII 的开关，凡是带空格/中文的内容一律走 stdin。
-      const args = ['-p', '--max-turns', options.maxTurns || MAX_TURNS, '--permission-mode', 'bypassPermissions', '--no-session-persistence'];
+      // --output-format json：为了拿 usage（token 数）给面板记账。stdout 只有一行
+      // JSON，正文在 result 字段里；解析失败就退回原来的纯文本处理，不会因为
+      // 版本差异把聊天弄哑。
+      sess = options.sessionKey ? sessionFor(options.sessionKey) : null;
+      const args = ['-p', '--output-format', 'json', '--max-turns', options.maxTurns || MAX_TURNS, '--permission-mode', 'bypassPermissions'];
+      if (sess) args.push(sess.resume ? '--resume' : '--session-id', sess.id);
+      else args.push('--no-session-persistence');
+
+      // 可选：用一份自己的系统提示文件整段替换掉 CLI 默认的那套（plugin.json 的 systemPromptFile）。
+      // 说话规矩、表情、历史全走 stdin，不进系统提示，所以人格不变，换的只是底下那层壳。
+      // 留空就用默认的；设环境变量 QQ_NO_PURGE=1 可以临时关掉。
+      try {
+        const custom = String(conf().systemPromptFile || '').trim();
+        if (!process.env.QQ_NO_PURGE && custom && fs.existsSync(custom)) {
+          args.push('--system-prompt-file', custom);
+        }
+      } catch { /* 读不到就照旧用默认系统提示 */ }
 
       // 内置工具也只留干活用得上的六个。其余（WebSearch/WebFetch/Agent/Notebook…）
       // 光说明书就占一万四千 token，聊天根本碰不到。
@@ -342,10 +661,19 @@ function runClaude(prompt, timeoutMs, options = {}) {
       try {
         fs.mkdirSync(STATE_DIR, { recursive: true });
         if (!fs.existsSync(EMPTY_MCP_FILE)) fs.writeFileSync(EMPTY_MCP_FILE, '{"mcpServers":{}}', 'utf8');
-        // 群聊默认不联网。想加，就在这儿写一份只含「搜索 / 抓网页」两个工具的
-        // MCP 配置（照 EMPTY_MCP_FILE 的格式改），把 --mcp-config 指过去，
-        // 再把 GROUP_TOOLS 里补上 mcp__<名字>__*。记住别顺手把 Bash 加进 GROUP_TOOLS。
-        args.push('--strict-mcp-config', '--mcp-config', EMPTY_MCP_FILE);
+        const mcpSrc = searchMcpSrc();
+        if (options.search && mcpSrc) {
+          // 群聊要能查东西。但只给这一条窄口子：MCP 里就「搜索 / 抓网页」两个工具，
+          // 模型拿不到 shell，也就绕不过 GROUP_TOOLS 那条红线。
+          fs.writeFileSync(SEARCH_MCP_FILE, JSON.stringify({
+            mcpServers: {
+              search: { command: searchNode(), args: [mcpSrc] },
+            },
+          }, null, 1), 'utf8');
+          args.push('--strict-mcp-config', '--mcp-config', SEARCH_MCP_FILE);
+        } else {
+          args.push('--strict-mcp-config', '--mcp-config', EMPTY_MCP_FILE);
+        }
       } catch { /* 建不出来就照旧带上 MCP，顶多贵一点 */ }
 
       child = spawn(claudeCmd(), args, {
@@ -371,11 +699,55 @@ function runClaude(prompt, timeoutMs, options = {}) {
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
-    child.on('close', (code) => {
+    const onClose = (code) => {
       clearTimeout(timer);
       const text = String(out || '').trim();
+
+      // --output-format json：正常返回就一行 JSON，正文在 result、token 数在 usage。
+      // 顺手记一笔账，面板那边才看得见 QQ 里花的量。
+      let parsed = null;
+      if (text.startsWith('{')) {
+        try { parsed = JSON.parse(text); } catch {
+          // 混进了别的东西（更新提示之类）：掐头去尾再试一次
+          const a = text.indexOf('{');
+          const b = text.lastIndexOf('}');
+          if (a >= 0 && b > a) { try { parsed = JSON.parse(text.slice(a, b + 1)); } catch { /* 放弃 */ } }
+        }
+      }
+      // 该是 JSON 却解析不出来 —— 宁可这轮不回，也不能把一整段 JSON 原样发进 QQ
+      if (!parsed && text.startsWith('{')) {
+        reject(new Error('claude 输出解析失败（不是合法 JSON）'));
+        return;
+      }
+      if (parsed && parsed.type === 'result') {
+        recordUsage(parsed, options.chatKey);
+        if (parsed.is_error) {
+          // 续不上的会话（被清理、跨机器重装之类）扔掉，下一轮自动新建一个
+          const msg = String(parsed.result || parsed.subtype || 'claude 报错');
+          if (sess?.resume && /no conversation|not found|no such session|resume/i.test(msg)) {
+            dropSession(options.sessionKey);
+          }
+          reject(new Error(msg.slice(0, 300)));
+          return;
+        }
+        const body = String(parsed.result ?? '').trim();
+        if (!body && code !== 0) {
+          reject(new Error(`claude 退出码 ${code}：${err.slice(-200)}`));
+          return;
+        }
+        if (sess && options.sessionKey) {
+          const u = parsed.usage || {};
+          markSession(options.sessionKey, sess.id,
+            (Number(u.input_tokens) || 0) + (Number(u.cache_read_input_tokens) || 0)
+            + (Number(u.cache_creation_input_tokens) || 0));
+        }
+        resolve(body);
+        return;
+      }
+
+      // 解析不出 JSON 就退回老路子。
       // claude 把这几类错误写在 stdout 上、退出码还是 0（比如 Reached max turns），
-      // 不拦下来就会原样发进 QQ，用户看见一串英文报错。
+      // 不拦下来就会原样发进 QQ，主人看见一串英文报错。
       if (/^Error:\s/i.test(text) && text.length < 300) {
         reject(new Error(text));
         return;
@@ -385,6 +757,16 @@ function runClaude(prompt, timeoutMs, options = {}) {
         return;
       }
       resolve(text);
+    };
+
+    // 插件里的未捕获异常会把 Electron 主进程整个带崩（10-28 那次 sess 就是，
+    // 弹个框直接退出）。这层兜底保证：出错最多这一轮不回话，bot 不掉线。
+    child.on('close', (code) => {
+      try {
+        onClose(code);
+      } catch (e) {
+        try { reject(e); } catch { /* 已经 settle 过就算了 */ }
+      }
     });
 
     child.stdin.write(prompt, 'utf8');
@@ -396,7 +778,7 @@ function runClaude(prompt, timeoutMs, options = {}) {
 function tidy(text) {
   let t = String(text || '').trim();
   t = t.replace(/^```[a-z]*\n?/i, '').replace(/```$/, '').trim();
-  t = t.replace(/^(用户[:：]\s*|我[:：]\s*|机器人[:：]\s*)/, '').trim();
+  t = t.replace(/^(主人[:：]\s*|我[:：]\s*)/, '').trim();
   t = t.replace(/\n{3,}/g, '\n\n');
   if (t.length > MAX_REPLY_CHARS) t = t.slice(0, MAX_REPLY_CHARS) + '…';
   return t;
@@ -421,7 +803,7 @@ function splitReply(text) {
   if (!t) return [];
 
   // 链接先整条挖出来换成占位符。URL 里的 ? 会被下面的句末标点正则当成句子结尾，
-  // 一条分享链接直接被劈成两条，QQ 里点开就是空页面。
+  // 一条分享链接直接被劈成两条，QQ 里点开就是空页面（2026-10-24 真踩了）。
   const urls = [];
   const masked = t.replace(URL_RE, (u) => {
     urls.push(u);
@@ -485,13 +867,65 @@ async function sendStickerSafe(orch, chatKey, ref) {
 }
 
 // ── 主流程 ──────────────────────────────────────────────────────────
-// 用户经常一句话拆成几段发，所以不能按固定时长一刀切：
+// 主人经常一句话拆成几段发，所以不能按固定时长一刀切：
 //   · 每多攒一条，就多给 2.5 秒耐心（说明他还在说）；
 //   · 但总共最多等 MAX_WAIT_MS，他要是没完没了地发也不能一直不回；
 //   · 从第一条算起，不是从最后一条 —— 否则刷屏能把回复无限推迟。
-// 整体放慢：等对方说完再回，抢着接话很奇怪。
+// 2026-10-24 晚整体放慢：他原话「等我说完一起回，不用急着回应，很奇怪」。
 const MAX_WAIT_MS = 30000;
 let bufferStartedAt = 0;
+
+// 2026-10-27 主人：「想让你用新对话回复，不让上下文影响」。私聊和群里各加一个触发词，
+// 发这几个字就把聊天记录清空（私聊 history 和群聊 groupHistory 一起清），从这条重新算。
+const RESET_RE = /新对话|清空上下文|重新开始聊/;
+function isResetWord(text) {
+  const t = String(text || '').trim();
+  return t.length <= 12 && RESET_RE.test(t);
+}
+
+// 2026-10-27 主人：「以后文件绕回去你就不用回话了」。
+// sendfile.mjs 发出去的文件，QQ 客户端点「接收」时会把它当成一条新的文件消息绕回来，
+// 看着像主人又发了一遍。sendfile 发成功时往这个文件记一笔，绕回来时认出来就别吭声。
+const SENT_FILES_FILE = path.join(STATE_DIR, 'sent-files.json');
+const SENT_FILE_ECHO_MS = 30 * 60 * 1000;   // 30 分钟内的才算自己刚发的
+
+/** 文件名比大小用：去掉大小写、空格、下划线、连字符和 QQ 重名时的 (1)。 */
+function normFileName(s) {
+  return String(s || '').trim().toLowerCase()
+    .replace(/\s*\(\d+\)(?=\.[^.]*$)/, '')
+    .replace(/[\s_\-()（）]/g, '');
+}
+
+/** 这条是不是刚由我 sendfile 出去、又被 QQ 绕回来的文件消息。 */
+function isOwnSentFileEcho(raw) {
+  const m = /^\[文件\s*(.+?)\s*\]/.exec(String(raw || ''));
+  if (!m) return false;
+  const want = normFileName(m[1]);
+  if (!want) return false;
+  let list = [];
+  try {
+    const j = JSON.parse(fs.readFileSync(SENT_FILES_FILE, 'utf8'));
+    list = Array.isArray(j?.files) ? j.files : [];
+  } catch { return false; }
+  const now = Date.now();
+  return list.some((it) => it && it.name
+    && now - Number(it.at || 0) <= SENT_FILE_ECHO_MS
+    && normFileName(it.name) === want);
+}
+
+/** 清空两边的聊天记录并落盘，返回清掉了几条。 */
+function resetHistories() {
+  const n = history.length + groupHistory.length;
+  history = [];
+  groupHistory = [];
+  buffer = [];
+  bufferStartedAt = 0;
+  groupBuffer = [];
+  groupStartedAt = 0;
+  saveHistory();
+  saveGroupHistory();
+  return n;
+}
 
 // 话没说完的样子：结尾挂着连接词或者逗号
 const HANGING_RE = /(而且|还有|然后|就是|因为|所以|但是|不过|另外|其实|如果|要是|以及|[，,、])$/;
@@ -510,12 +944,12 @@ function scheduleFlush(delay) {
   }, wait);
 }
 
-/** 用户只发了图、没带字：看一眼，判断要不要收进表情库。 */
+/** 主人只发了图、没带字：看一眼，判断要不要收进表情库。 */
 async function flushImage(orch, job) {
   const { entry, chatKey } = job;
   const localPath = await downloadIncoming(entry);
   const caption = String(entry.text || '').replace(/\[图片\]/g, '').trim();
-  const raw = await runClaude(buildImagePrompt(localPath, caption), Number(conf().timeoutMs) || DEFAULT_TIMEOUT_MS);
+  const raw = await runClaude(buildImagePrompt(localPath, caption), Number(conf().timeoutMs) || DEFAULT_TIMEOUT_MS, { search: true, chatKey, sessionKey: chatKey });
   const hit = raw.match(COLLECT_RE);
   const parts = splitReply(String(raw).replace(COLLECT_RE, '').trim());
   if (parts.length) await orch.sender.sendTextBatch(chatKey, parts);
@@ -560,15 +994,15 @@ async function flush() {
   busy = true;
   logger.info('claude-bridge', `转给 claude（${lines.length} 条）：${lines.join(' / ').slice(0, 60)}`);
 
-  // 翻日志发现超时大多是「让它自己上手摸」的活：摸满 5 分钟才吐兜底话，
-  // 中间一声不吭，对面只能干等。所以超过 90 秒先吱一声。
+  // 2026-10-24 主人抱怨「总是一堆错误」：翻日志发现超时全是「让我自己上手摸」的活，
+  // 摸到 5 分钟满才吐兜底话，中间一声不吭，他只能干等。超过 90 秒先吱一声。
   let progressTimer = null;
   progressTimer = setTimeout(() => {
     Promise.resolve(orch.sender.sendTextBatch(chatKey, ['这个我得弄一会儿，稍等我喵'])).catch(() => {});
   }, 90000);
 
   try {
-    const raw = await runClaude(buildPrompt(lines), Number(conf().timeoutMs) || DEFAULT_TIMEOUT_MS);
+    const raw = await runClaude(buildPrompt(lines, chatKey), Number(conf().timeoutMs) || DEFAULT_TIMEOUT_MS, { search: true, chatKey, sessionKey: chatKey });
     if (progressTimer) { clearTimeout(progressTimer); progressTimer = null; }
     const { text: body, stickerRef } = extractSticker(raw);
     const parts = splitReply(scrubMarks(body));
@@ -599,88 +1033,189 @@ async function flush() {
 }
 
 // ── 群聊 ────────────────────────────────────────────────────────────
-// 群聊是另一条通道：群号要在设置里列出来，只读工具，永不给 shell。
+// 机器人也能被拉进群，在里面像个人一样聊天。群功能默认关着，
+// 只有在 plugin.json 的 groupIds 里列了群号，才会进群接话。
 //
-// ⚠️ 红线：**群聊永远不给 Bash / Write / Edit。** 私聊那份权限全开是因为那头只有用户一个人；
+// ⚠️ 红线：**群聊永远不给 Bash / Write / Edit。** 私聊那份权限全开是因为那头只有主人一个人；
 // 群里还有别人，给了写和命令就等于把电脑交到一群人手上。这里只放读的三个工具，
 // 想改东西一律推掉。以后谁要是为了「方便」把 GROUP_TOOLS 加长，先回来读这段。
-// 机器人自己的 QQ 号和名字都走配置（设置里填 selfUin / botNames），不写死。
-function selfUin() { return String(conf().selfUin || '').trim(); }
-function botNames() {
-  const raw = conf().botNames;
-  const list = Array.isArray(raw) ? raw : String(raw || '').split(/[,，\s]+/);
-  return list.map((v) => String(v).trim()).filter(Boolean);
+function selfUin() {                             // 我自己的号，认 @ 用
+  return String(conf().selfUin || '').trim();
 }
 const GROUP_HISTORY_FILE = path.join(STATE_DIR, 'group-history.json');
-// 想给群聊加联网，也只许加「搜索 / 抓网页」那种窄 MCP，
-// **不是**把 Bash 加进来。这个区别是整条红线的全部意义，别搞混。
-const GROUP_TOOLS = 'Read,Grep,Glob';
+// 群里的联网能力走 MCP 那两个口子，**不是**把 Bash 加进来。
+// 这个区别是整条红线的全部意义，别搞混。
+const GROUP_TOOLS = 'Read,Grep,Glob,mcp__search__web_search,mcp__search__fetch_page';
 const GROUP_HISTORY_MAX = 160;   // 群里话密，40 条一眨眼就滚没了
 const GROUP_MAX_TURNS = 8;                       // 群里聊天用不着转几十圈
 const GROUP_WAIT_MS = 4000;                      // 被叫到：等 4 秒就够
-// 攒太久就抢不上话，省下的那点 token 不值当。9 秒起、每多一条再加 1.5 秒。
+// 攒久一点能省 token，但太久了接不上话。9 秒这个值试下来最平衡。
 const GROUP_WAIT_IDLE_MS = 9000;                 // 没人叫我，多等一会儿再看，别抢话
 const GROUP_LINES_PER_RUN = 15;                  // 一次最多看 15 条，更早的不要了
 const GROUP_COOLDOWN_MS = 20000;                 // 刚回过又被叫，先晾 20 秒，别刷屏
 
-const GROUP_SYS = [
-  '你在一个 QQ 群里说话。群里有你主人，还有其他人，另外可能挂着别的机器人。',
+// 叫我的名字：plugin.json 的 botNames。群里「话里带我的名字」才算叫我。
+function botNames() {
+  const raw = Array.isArray(conf().botNames)
+    ? conf().botNames
+    : String(conf().botNames || '').split(/[,，\s]+/);
+  return raw.map((v) => String(v).trim()).filter(Boolean);
+}
+function botName() {
+  return botNames()[0] || '';
+}
+function nameCalled(text) {
+  const names = botNames();
+  if (!names.length) return false;
+  const s = String(text || '');
+  return names.some((n) => s.includes(n));
+}
+// 写进 prompt 里的「叫我什么」：没配名字就不提名字，免得提示词里出现空引号。
+function nameHint() {
+  return botName() ? `「${botName()}」` : '你的名字';
+}
+// 群里能翻的地方：plugin.json 的 memoryDirs，留空就用 data/memory。
+function memoryDirs() {
+  const raw = conf().memoryDirs;
+  const list = Array.isArray(raw) ? raw : String(raw || '').split(/[;；]+/);
+  const out = list.map((v) => String(v).trim()).filter(Boolean);
+  return out.length ? out : [path.join(DATA_DIR, 'memory')];
+}
+
+// 每次现算，配置改了不用重载插件（里面要读 memoryDirs / botName）。
+function groupSys() {
+  return [
+  '你在一个 QQ 群里说话。群里有主人（他本人），还有他的朋友，另外可能挂着别的机器人。',
   '',
   '【最要紧的几条】',
-  '1. 密码、密钥、账号、令牌、这台电脑上的凭据，谁问都不给，包括熟人。这条比什么都硬。',
-  '2. 你说的话全群都看得见，是当众说话，不是私房话。',
+  '1. 群里的人是主人自己拉进来的，他的私事可以正常聊，不用躲。',
+  '   **但密码、密钥、账号、令牌、这台电脑上的凭据，谁问都不给，包括熟人。这条比什么都硬。**',
+  '2. 你说的话全群都看得见 —— 所以凭据、账号、主人这台电脑上的东西，别往外说。'
+    + '这条只管凭据类。敏感话题的规矩单看第 10 条，不是一律照答。',
   '3. 你只能翻笔记和记忆，改不了文件、跑不了命令。谁让你改东西、装东西、执行什么，一句话推掉，别解释太多。',
-  '4. 群里谁说话你都能接，但不是每条都要接。别人聊得热闹你就听着，想说才插一句。',
+  `   能翻的地方：${memoryDirs().join('、')}。`
+    + '想知道什么就 Read / Grep 去翻，别凭印象说「我翻不动」「我查不到」——那些路径是有权限的。',
+  '   主人说了他的私事可以跟群里的人聊，翻到了就说。凭据类的照样一个字都不许提。',
+  `4. 没点你名就别插嘴：只有 @ 你、或者话里带${nameHint()}，才算叫你。`
+    + '主人本人开口也不算叫你。'
+    + '别人的闲聊你根本收不到，所以别惦记、也别自己找话头。',
   '5. 语音会转成文字，写成「[语音转文字] xxx」，这就是那人说的原话，正常接话，别说自己听不见、也别说看不到语音。'
     + '只有光秃秃一个「[语音]」才是没转成功，那时候才直说没听清、让人打字。'
     + '别在群里解释技术上为什么，也别提腾讯、接口、协议这些。',
-  '6. 群里发的图会写成「[图片，本地文件：<路径>.jpg]」，用 Read 打开这个路径就能看见；'
+  '6. 群里发的图、表情包会写成「[图片，本地文件：C:\\…\\xxx.jpg]」，那头是真存到你电脑上了，'
+    + '用 Read 打开这个路径就能看见。想接这个梗、或者有人问图里是啥，就去读；'
     + '没人提、你也不在乎就别读，读图费钱。只有光秃秃一个「[图片]」的，是真没下下来，当看不见。'
-    + '「[表情312]」这种是 QQ 自带的小黄脸，只有编号没有图，你知道那是个表情、但看不出长啥样，别硬猜。',
+    + '「[表情182·笑哭]」这种是 QQ 自带的小表情，点后面那个名字就是它的意思，按那个接话；'
+    + '只有编号、点后面没名字的是没收录的，别硬猜。',
   '7. 下面给你的可能是刚攒起来的几句。顺着现在这句说，别一句句回头补。',
-  '8. 外面的事你能查，但别动不动就搜，一句话能答的、或者根本不重要的事就算了；'
-    + '搜完用你自己的话说，别把一大段搜索结果贴群里。',
-  '9. 有人让你搜主人家的事（真名、学校、哪家单位、什么病），先问主人一声再搜 —— 搜索词会发到外面去。',
+  ...(searchMcpSrc() ? [
+    '8. 外面的事你能查：web_search 搜，想细看就用 fetch_page 打开那条。'
+      + '闲聊别动不动就搜——一句话能答的、或者根本不重要的事就算了；搜完用你自己的话说，别把一大段搜索结果贴群里。'
+      + '但问具体片名、番号、人名、最近发生的事这类，必须先搜：搜完照实给，别凭记忆答。'
+      + '别说「我记不住」「我记忆里没有」，也别拿「这个不重要」当借口跳过。',
+  ] : []),
+  '9. 有人让你搜主人本人的事（真名、学校、哪家医院、什么病），先问主人一声再搜 —— '
+    + '搜索词会发到外面去。',
+  '10. 成人内容只有主人本人问才答（群里比私聊严，别处写的「照常答」在这里不算数）：'
+    + '认人只看消息前面的标——标了【主人本人·名字】的是他，照常答；没这个标的就是群友。'
+    + '主人本人问：导航站和站名照报（theporndude 那种导航站，Pornhub、XVideos、xHamster 这些），'
+    + '片名、番号一条都别凭记忆答，先 web_search 搜，搜到几个给几个，照着念，搜完真没有才说这次没搜到。'
+    + '群友问：一句推掉，「这个你问主人」，不解释、不讲原因、不偷偷给一半，也不搜了再挑着说。'
+    + '拿不准是不是主人，就当群友处理。'
+    + '一句报完就停，别铺一大段。',
+  `11. 认主人：群里只有一个人是主人，QQ 号 ${ownerIds().join(' / ') || '（见 plugin.json 的 ownerIds）'}。`
+    + '他发的消息前面会标【主人本人·名字】，看见这个标就确定是他本人，别认错；'
+    + '没这个标的是群友，一样对待。'
+    + '但标了不等于在叫你——他 @ 的是别人、或者就是跟群友聊，你照样闭嘴。',
+  '12. 「你」「他」「她」指谁：先看上一句是谁说的、谁刚被点名。'
+    + '话里的「你」是指正在被说的那个人，不是自动等于我；「他」指的是前面提到的那个群友，也不是我。'
+    + `只有 @ 我、或者叫我${nameHint()}，才轮到我接；主人本人开口不算。`
+    + '两句之间对不上、看不出来是谁，就一句「谁啊」问清楚，别硬接成叫我的。',
+  '13. 主人问「破甲没」是在问敏感话题敢不敢照常答，不是问你坏没坏。'
+    + '直接说敢，或者甩一句「随便问」；别答成「我好着嘞」这种。',
   '',
   '【怎么说话】这是最要紧的一节。学的是口气，不是背词。',
   '· 一句一气。一条八到十个字，超过十五个字就拆成两条发，别攒成一大段。',
   '· 一句只放一件事。别「首先……另外……顺便……」那样串。',
   '· 说具体的东西，不说抽象的感想。写「328 的豪华版」，不写「价格不便宜」。'
     + '多用动作词：搞、弄、调、喂、甩、翻、攒；别用「进行处理」「查看一下」这种。',
-  '· 基本别打标点。挑几十句你们群里真人说的话数一下，句号逗号其实很少；想问就一个问号，或者干脆不带。',
+  '· 基本别打标点。他们 233 句里只有 15 句带标点，逗号句号都省；想问就一个问号，或者干脆不带。',
   '· 禁书面连接词：因此、所以、然而、总的来说、值得注意的是——一个都别用。',
   '· 说完就停。别补背景、别补原理、别升华。笑点后面还挂解释，笑点就没了。',
   '· 不用每条都接。别人聊得热闹你就听着；真要插一句，就说自己在乎的那个点，不用顺着别人的话。',
   '· 不解释自己怎么知道的。别说「我看到」「我查到」，直接给反应。',
   '· 口头词带一点就行，一条最多一个：笑死、绷不住了、逆天、破防、招笑、谁懂。堆两个就假了。',
-  '· 群里人说话爱带尾音：咯、嘞、勒、喽。你也偶尔收一下，一条里最多一个。',
-  '· 用你们平时的那个称呼，别喊全名，也别说你俩是怎么认识的。',
+  '· 群里人说话爱带尾音：咯、嘞、勒、喽。你也偶尔收一下，一条里最多一个。'
+    + '「喵」和这些别挤在同一句里，挑一个。',
+  '· 叫他「主人」，别说他全名，也别说咱俩是怎么认识的。',
   '',
-  '【口气长这样】把下面这几条换成你们群里真人说过的原话，学调子，别照抄内容：',
+  '【口气长这样】下面是真人聊天时的调子，学口气，别照抄内容：',
   '　「对呀，为什么」',
+  '　「这事儿还能这么搞的」',
   '　「人工智能好聪明嘞」',
   '　「那也就十多块钱勒」',
   '　「很玄乎勒」',
   '　「就这样咯」',
   '　「不想送直说」',
+  '　「蛇分为有毒和没毒，但是我看到蛇都是绕着走」',
+  '　「神了，高中同学找我借了 600，一年多了还没给我，目前查无此人」',
   '　「这事儿挺招笑的」',
   '看共同点：短、具体的物、不解释、说完就完，句尾轻轻收一下。',
-].join('\n');
+  ].join('\n');
+}
 
-// ── 语音 ────────────────────────────────────────────────────────────
-// 转写不在这层做：QQ-agent 核心在消息入库前会问 `media.transcribe` 能力，
-// 由 voice-transcribe 插件（本地 faster-whisper）转好，text 里直接就是
-// 「[语音转文字] 原话」。核心没转成功时留下的是光秃秃的「[语音]」，
-// 那才让模型说没听清。所以这里只要透传 text，别自己再转一遍。
+// ── 语音：借 QQ 自己的语音转文字 ──────────────────────────────────────
+// 主人 2026-10-24 问「能不能直接用 qq 自带的语音转文字」。能——snowluma 实现了
+// NapCat 那套 `fetch_ptt_text`：把消息里的 record 段交给 QQ 自己的 pttTrans 接口，
+// 拿回腾讯转好的文字。不装 whisper、不转码、音频也不落地，代价只是走一次腾讯服务端。
+// ⚠️ 它的硬限制是「语音得还在本机缓存里」，所以收到就得转，不能等合并窗口过去再说。
+function onebotHttp() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'config.json'), 'utf8'));
+    const url = String(raw?.snowluma?.httpUrl || '').trim().replace(/\/+$/, '');
+    const token = String(raw?.snowluma?.httpAccessToken || '').trim();
+    return url ? { url, token } : null;
+  } catch { return null; }
+}
+
+/** 转不出来就返回空串，调用方保留 [语音] 占位，别编。 */
+async function fetchVoiceText(mid) {
+  if (mid == null) return '';
+  const target = onebotHttp();
+  if (!target) return '';
+  try {
+    const res = await fetch(`${target.url}/fetch_ptt_text?access_token=${encodeURIComponent(target.token)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message_id: Number(mid) }),
+      signal: AbortSignal.timeout(25000),
+    });
+    const j = await res.json();
+    if (j?.status !== 'ok') {
+      // 2026-10-25：之前把失败整个吞了，群里只看到「没转出来」，查半天才知道
+      // 是腾讯服务端拒的（errCode 4294966146 之类）。原因留在这儿，下次一眼能看见。
+      logger.warn('claude-bridge', `语音转写被拒：retcode=${j?.retcode} ${String(j?.wording || j?.message || '').slice(0, 120)}`);
+      return '';
+    }
+    const data = j.data;
+    return String(typeof data === 'string' ? data : (data?.text ?? '')).trim();
+  } catch (e) {
+    logger.warn('claude-bridge', `语音转写请求失败：${e?.message ?? e}`);
+    return '';
+  }
+}
 
 // ── 图片 / 表情包：收到就落地，模型想看再 Read ────────────────────────
-// 群聊也要能看图：把图落到本地，模型想看再用 Read 打开。
+// 2026-10-25 主人：「你在群里看不了表情包」。
 // 以前消息进模型眼里的就是干巴巴一个「[图片]」，图本身早扔了。
 // 现在的做法：消息一到就把图下载到本地，把**本地路径**写进那行文字。
 // 模型手上有 Read，读本地图就能看见；不想看就不读，一分钱不花。
 // 注意别改成「自动 Read」——群里连发表情包会把 token 烧穿。
 const GROUP_MEDIA_DIR = path.join(STATE_DIR, 'media');
-const GROUP_MEDIA_MAX_BYTES = 3 * 1024 * 1024;
+// 2026-10-26 主人：「让群里的你也能看图」。
+// 原来卡 3MB，可 QQ 原图动辄五六兆（实测一张 6.1MB 的街拍照直接被丢，
+// 群里就只剩一个「[图片]」占位）。Read 读 6MB 的 jpg 没问题，放到 12MB。
+const GROUP_MEDIA_MAX_BYTES = 12 * 1024 * 1024;
 const GROUP_MEDIA_MAX_COUNT = 3;
 const GROUP_MEDIA_KEEP_MS = 24 * 3600 * 1000;
 
@@ -734,14 +1269,17 @@ async function grabImages(entry) {
   const out = [];
   for (const m of imgs) {
     try {
-      const res = await fetch(String(m.url), { signal: AbortSignal.timeout(15000) });
-      if (!res.ok) continue;
+      const res = await fetch(String(m.url), { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) { logger.warn('claude-bridge', `群图下载失败：HTTP ${res.status}`); continue; }
       const buf = Buffer.from(await res.arrayBuffer());
-      if (!buf.length || buf.length > GROUP_MEDIA_MAX_BYTES) continue;
+      if (!buf.length || buf.length > GROUP_MEDIA_MAX_BYTES) {
+        logger.warn('claude-bridge', `群图跳过：${buf.length} 字节，上限 ${GROUP_MEDIA_MAX_BYTES}`);
+        continue;
+      }
       const file = path.join(GROUP_MEDIA_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${imageExt(buf, m.file)}`);
       fs.writeFileSync(file, buf);
       out.push({ file, summary: String(m.summary || '').slice(0, 40), size: buf.length });
-    } catch { /* 单张失败不影响别的 */ }
+    } catch (e) { logger.warn('claude-bridge', `群图下载异常：${e?.message ?? e}`); }
   }
   pruneMediaDir();
   return out;
@@ -767,6 +1305,8 @@ let groupStartedAt = 0;
 let groupOrch = null;
 let groupChatKey = '';
 let groupLastReplyAt = 0;
+let groupMuted = false;      // 主人在群里说「安静」之后为 true，不再接任何人的话
+const GROUP_MUTE_RE = /^(安静|静音|都闭嘴|别说了)[\s!！。.~～]*$/;
 
 function groupIds() {
   const raw = conf().groupIds;
@@ -789,8 +1329,7 @@ function saveGroupHistory() {
 }
 
 /**
- * 白名单群里谁说话都听（别只听 @ 的，那样像冷场），
- * 但只有 @ 它、或者叫它的名字才算「叫到」，那种必须应声。
+ * 白名单群里谁说话都听，但只有 @ 我、或者话里带我名字的，才算「叫我」，那种必须应声。
  * 其余的接不接由我自己在 prompt 里判断，不想说就回 PASS，这条不发出去。
  */
 function groupEntry(chatKey, entry) {
@@ -803,14 +1342,23 @@ function groupEntry(chatKey, entry) {
   if (!rawText || /^\[CQ:[^\]]+\]$/.test(rawText)) return null;        // 纯图/表情/系统消息不接
   const text = rawText.replace(/\[CQ:at,[^\]]+\]/g, '').trim();
   if (!text) return null;
-  // @ 了谁先看清楚 —— 冲别人说的就当没看见，连 buffer 都不进。
+  // @ 别人的话没必要回，很奇怪 —— 所以 @ 了谁先看清楚，没 @ 到我就当没看见，连 buffer 都不进。
   const atTargets = [...rawText.matchAll(/\[CQ:at,qq=([^,\]\s]+)/g)].map((m) => m[1]);
-  const called = atTargets.includes('all')
+  // 判定顺序：
+  //   1) @ 了人但没 @ 到我 → 当没看见（@全体 例外，那算叫我）
+  //   2) @ 到我 / @全体 / 带我的名字 → called，必须应声
+  //   3) 一个 @ 都没有 → 照样进 buffer（called=false），接不接由我自己在 prompt 里判断，
+  //      不想说就回 PASS，这条不发出去。
+  const atAll = atTargets.includes('all');
+  const atMe = atAll
     || (me && atTargets.includes(me))
-    || (me && new RegExp(`@\\s*${me}\\b`).test(rawText))
-    || botNames().some((n) => rawText.includes(n));
-  if (!called && atTargets.length) return null;   // 冲别人说的，不插嘴
-  return { text, called };
+    || (me ? new RegExp(`@\\s*${me}\\b`).test(rawText) : false);
+  // 主人本人的消息照样进 buffer、进 prompt 时标明【主人本人】，别把他当普通群友晾着；
+  // 但「是他本人」不等于「在叫我」—— 还得看他有没有 @我、或者带我的名字。
+  const owner = ownerIds().includes(String(entry?.senderId || ''));
+  if (atTargets.length && !atMe && !owner) return null;
+  const called = atMe || nameCalled(rawText);
+  return { text, called, owner };
 }
 
 function scheduleGroupFlush() {
@@ -833,21 +1381,25 @@ function scheduleGroupFlush() {
 // ── 群友印象 ────────────────────────────────────────────────────────────
 // QQ-agent 自己有一套「群记忆」：每 6 小时从聊天里给每个群友提炼最多 5 条印象，
 // 存在 data\memory\group_<群号>\<QQ号>.json。那套东西原来只喂给它自己的 DeepSeek，
-// 这条 claude 通道原本一个字都读不到，所以从这儿补上。
+// 我这条 claude 通道一个字都读不到。2026-10-25 主人说接上，就从这儿读。
 const MEMORY_ROOT = path.join(DATA_DIR, 'memory');
 const IMPRESSION_PER_MEMBER = 3;              // 每人只取最新 3 条，多了纯烧钱
 const IMPRESSION_CACHE_MS = 10 * 60 * 1000;   // 10 分钟，免得每条消息都读盘
 let impressionCache = { key: '', at: 0, text: '' };
 
-/** 读群友印象，拼成「名字：印象；印象」若干行。读不到就返回空串，绝不让群聊挂掉。 */
-function loadGroupImpressions(chatKey) {
+/** 读印象，拼成「名字：印象；印象」若干行。读不到就返回空串，绝不让聊天挂掉。
+ *  目录按 chatKey 的前缀走：group:123 → memory/group_123，private:456 → memory/private_456。
+ *  2026-10-28 主人说私聊也要接上，所以不再只认 group。 */
+function loadImpressions(chatKey) {
   const now = Date.now();
   if (impressionCache.key === chatKey && now - impressionCache.at < IMPRESSION_CACHE_MS) {
     return impressionCache.text;
   }
   let text = '';
+  const key = String(chatKey ?? '');
+  const [scope, id] = key.includes(':') ? key.split(':') : ['group', key];
   try {
-    const dir = path.join(MEMORY_ROOT, `group_${String(chatKey ?? '').replace(/^group:/, '')}`);
+    const dir = path.join(MEMORY_ROOT, `${scope}_${id}`);
     const rows = [];
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.json') || f.startsWith('_')) continue;
@@ -871,10 +1423,10 @@ function loadGroupImpressions(chatKey) {
 
 function buildGroupPrompt(lines) {
   const called = lines.some((l) => l.called);
-  const parts = ['【群聊，不是私聊。下面这些是硬规矩】', GROUP_SYS];
+  const parts = ['【群聊，不是私聊。下面这些是硬规矩】', groupSys()];
   // 印象卡是别的模型整理的，会过时也会记错，所以只说「参考」；更要紧的是别照着它
   // 主动往外说 —— 里面记着人家的账号糟心事、证件，群里说出来是要出事的。
-  const impressions = loadGroupImpressions(groupChatKey);
+  const impressions = loadImpressions(groupChatKey);
   if (impressions) {
     parts.push(
       '',
@@ -883,14 +1435,16 @@ function buildGroupPrompt(lines) {
       '心里有数就行，别主动把这里的内容说出来——尤其是别人的私事、账号、证件这一类，一个字都别提。'
     );
   }
-  if (groupHistory.length) {
+  if (!USE_SESSION && groupHistory.length) {
     parts.push('', '群里刚才聊的：');
     for (const m of groupHistory.slice(-30)) {
-      parts.push(`${m.role === 'assistant' ? '你' : ''}${m.text}`.slice(0, 500));
+      parts.push(`${m.role === 'assistant' ? '你' : ''}${renderFaces(m.text)}`.slice(0, 500));
     }
   }
   parts.push('', '群里刚在说：');
-  for (const l of lines) parts.push(`${l.name}：${l.text}${l.called ? '（在叫你）' : ''}`);
+  for (const l of lines) {
+    parts.push(`${l.owner ? `【主人本人·${l.name}】` : l.name}：${renderFaces(l.text)}${l.called ? '（在叫你）' : ''}`);
+  }
   parts.push('');
   if (called) {
     parts.push('有人在叫你，你得出声，不能沉默。');
@@ -898,8 +1452,11 @@ function buildGroupPrompt(lines) {
     parts.push('没人叫你。想插一句就插，就说你在乎的那个点；插不上、或者插了也是废话，就只回 PASS 一个词，我这边不会发出去。');
     parts.push('连着几句都是别人在讲自己的事，那就 PASS，别硬找话。');
   }
-  // 群里发图本来没接表情库，后来补上了。频率上也有讲究：
-  // 无条件把菜单塞进去会天天发，改成「这一批里有人发了表情包，才给菜单和许可」。
+  // 2026-10-25 群友问「你会不会用表情包了」，我只会说「发不出去」——
+  // 因为群里这条路压根没接上：私聊有 @@表情:id@@ 那一整套，群里只把标记刮掉了。
+  // 2026-10-25 主人说「感觉有点频繁了，别人发表情包你再回一张」。
+  // 原来是无条件把菜单塞进去、还写着「可以用得勤一点」，难怪见天发。
+  // 改成：这一批里有人发了表情包，才把菜单和许可给出去。
   const menu = lines.some((l) => l.sticker) ? stickerMenu() : '';
   if (menu) {
     parts.push(
@@ -934,6 +1491,8 @@ async function groupFlush() {
       tools: GROUP_TOOLS,
       maxTurns: GROUP_MAX_TURNS,
       search: true,
+      chatKey: groupChatKey,
+      sessionKey: groupChatKey,
     });
     // 群里绝对不能漏出内部标记，scrubMarks 是最后一道闸
     const { text: body, stickerRef } = extractSticker(raw);
@@ -945,6 +1504,8 @@ async function groupFlush() {
       parts = ['在呢'];
       silent = false;
     }
+    // 主人在群里刚说过「安静」，手上这一轮还在跑也别发出去
+    if (groupMuted) silent = true;
     if (!silent && parts.length && groupOrch) {
       await groupOrch.sender.sendTextBatch(groupChatKey, parts);
       groupLastReplyAt = Date.now();
@@ -954,7 +1515,13 @@ async function groupFlush() {
       await sendStickerSafe(groupOrch, groupChatKey, stickerRef);
       groupLastReplyAt = Date.now();
     }
-    for (const l of lines) groupHistory.push({ role: 'user', text: `${l.name}：${l.text}`, ts: Date.now() });
+    for (const l of lines) {
+      groupHistory.push({
+        role: 'user',
+        text: `${l.owner ? `【主人本人·${l.name}】` : l.name}：${l.text}`,
+        ts: Date.now(),
+      });
+    }
     groupHistory.push({ role: 'assistant', text: silent ? '（没插话）' : parts.join(' '), ts: Date.now() });
     saveGroupHistory();
     logger.info('claude-bridge', silent ? '群里看了没接' : `群里回了 ${parts.length} 条`);
@@ -970,48 +1537,88 @@ function handleGroup(orch, chatKey, entry) {
   const hit = groupEntry(chatKey, entry);
   if (!hit) return false;
   const name = String(entry?.senderName || entry?.nickname || entry?.senderCard || entry?.senderId || '群友');
-  const { text, called } = hit;
+  const { text, called, owner } = hit;
   groupOrch = orch;
   groupChatKey = chatKey;
   try {
     if (typeof orch.store?.markEntryRead === 'function') orch.store.markEntryRead(chatKey, entry.id);
   } catch { /* 标不上就标不上 */ }
   // 别人发了表情包吗？image 段带 summary 的就是表情包（普通照片没这个字段）。
-  // 用户的要求是「别人发了，我才回一张」，所以这个标记决定要不要给表情菜单。
+  // 主人的要求是「别人发了，我才回一张」，所以这个标记决定要不要给表情菜单。
   const sticker = Array.isArray(entry?.media)
     && entry.media.some((m) => m && m.kind === 'image' && String(m.summary ?? '').trim() !== '');
-  const line = { name, text, called, sticker };
+  // 2026-10-27 主人：「我在群里发安静这两个字时，你回复一下，然后停止接话」
+  // 认主人本人发的，群友喊「安静」不算数；静音期间别人说什么都不进 buffer，
+  // 主人自己再开口就自动解除，免得他以为我又哑了。
+  const fromOwner = owner;
+  if (GROUP_MUTE_RE.test(text) && fromOwner) {
+    groupMuted = true;
+    groupBuffer = [];
+    groupStartedAt = 0;
+    if (groupTimer) { clearTimeout(groupTimer); groupTimer = null; }
+    logger.info('claude-bridge', '主人在群里说安静，停止接话');
+    Promise.resolve(orch.sender.sendTextBatch(chatKey, ['好喵 我不说了'])).catch(() => {});
+    return true;
+  }
+  if (groupMuted) {
+    if (!fromOwner) {
+      logger.info('claude-bridge', '群聊静音中，跳过一条');
+      return true;
+    }
+    groupMuted = false;
+    logger.info('claude-bridge', '主人在群里又说话了，解除静音');
+  }
+  // 群里只有主人说「新对话」才算，群友起哄不算
+  if (isResetWord(text) && fromOwner) {
+    const n = resetHistories();
+    logger.info('claude-bridge', `主人在群里要开新对话，清掉 ${n} 条历史`);
+    Promise.resolve(orch.sender.sendTextBatch(chatKey, ['清干净了喵 从这条开始重新算'])).catch(() => {});
+    return true;
+  }
+  const line = { name, text, called, sticker, owner };
   const queued = () => {
     if (!groupBuffer.length) groupStartedAt = Date.now();
     groupBuffer.push(line);
     scheduleGroupFlush();
   };
 
-  // 图的 url 带 rkey，有时效，收到就得先落地再去排队。
+  // 语音要趁还在缓存里马上转；图也有时效（url 带 rkey），都是收到就先处理再去排队。
+  const hasVoice = text.includes('[语音]') && entry?.mid != null;
   const hasImage = Array.isArray(entry?.media) && entry.media.some((m) => m && m.kind === 'image');
-  if (!hasImage) {
+  if (!hasVoice && !hasImage) {
     queued();
     logger.info('claude-bridge', called ? `群里被叫到（${name}）` : `群里在聊（${name}）`);
     return true;
   }
 
-  grabImages(entry).then((got) => {
+  Promise.all([
+    hasImage ? grabImages(entry) : Promise.resolve([]),
+    hasVoice ? fetchVoiceText(entry.mid) : Promise.resolve(''),
+  ]).then(([got, spoken]) => {
     if (got.length) {
       line.text = markImages(line.text, got);
       logger.info('claude-bridge', `群里存下图（${name}，${got.length} 张）`);
-    } else {
+    } else if (hasImage) {
       logger.warn('claude-bridge', `群里的图没下下来（${name}），按 [图片] 占位处理`);
+    }
+    if (spoken) {
+      line.text = line.text.replace('[语音]', `[语音]说的是：${spoken}`);
+      logger.info('claude-bridge', `群里语音转成文字（${name}，${spoken.length} 字）`);
+    } else if (hasVoice) {
+      logger.warn('claude-bridge', `群里语音没转出来（${name}），按 [语音] 占位处理`);
     }
     queued();
   }).catch(queued);
-  logger.info('claude-bridge', called ? `群里被叫到（${name}，图）` : `群里在聊（${name}，图）`);
+  logger.info('claude-bridge', called
+    ? `群里被叫到（${name}${hasImage ? '，图' : ''}${hasVoice ? '，语音' : ''}）`
+    : `群里在聊（${name}${hasImage ? '，图' : ''}${hasVoice ? '，语音' : ''}）`);
   return true;
 }
 
 let currentOrch = null;
 let currentChatKey = '';
 
-/** 命中条件：用户的私聊、纯文字。 */
+/** 命中条件：主人的私聊、纯文字。 */
 function isOwnerPrivate(chatKey, entry) {
   if (!String(chatKey || '').startsWith('private:')) return false;
   const sid = String(entry?.senderId || '');
@@ -1029,7 +1636,7 @@ function handle(orch, chatKey, entry) {
   if (handleGroup(orch, chatKey, entry)) return true;
 
   // 图片/表情优先：原来这类消息被 isOwnerPrivate 挡掉、放行给原机器人，
-  // 于是用户发的图我既看不见也收不了。
+  // 于是主人发的图我既看不见也收不了。
   if (isOwnerImage(chatKey, entry)) {
     currentOrch = orch;
     currentChatKey = chatKey;
@@ -1039,7 +1646,7 @@ function handle(orch, chatKey, entry) {
       }
     } catch { /* 标不上就标不上 */ }
     pendingImage = { entry, chatKey };
-    logger.info('claude-bridge', '用户发来一张图，等会儿看看是什么');
+    logger.info('claude-bridge', '主人发来一张图，等会儿看看是什么');
     scheduleFlush(Number(conf().debounceMs) || DEFAULT_DEBOUNCE_MS);
     return true;
   }
@@ -1056,18 +1663,35 @@ function handle(orch, chatKey, entry) {
     }
   } catch { /* 标不上就标不上，最多多触发一次 */ }
 
-  // 核心只把文件渲染成「[文件xxx]」，一个字的内容都不带。
-  // 消息里存着下载地址，所以把消息号补在括号里，模型就能自己取下来读。
+  // 2026-10-24 主人问「为啥发你文件读不了」：核心只把文件渲染成「[文件xxx]」，
+  // 内容一个字都没带。好消息里存着下载地址，把消息号补上它就能自己取。
   const raw = String(entry.text).trim();
+  if (isOwnSentFileEcho(raw)) {
+    logger.info('claude-bridge', `自己发出去的文件绕回来了，不理：${raw.slice(0, 60)}`);
+    return true;   // 已读也标过了，不回复、不进历史
+  }
+  if (isResetWord(raw)) {
+    const n = resetHistories();
+    logger.info('claude-bridge', `主人要开新对话，清掉 ${n} 条历史`);
+    Promise.resolve(orch.sender.sendTextBatch(chatKey, ['清干净了喵 从这条开始重新算'])).catch(() => {});
+    return true;
+  }
   const pushLine = (line) => {
     if (!buffer.length) bufferStartedAt = Date.now();   // 这一串连发从第几条开始计时
     buffer.push(line);
-    logger.info('claude-bridge', `收到用户私聊（未读 ${buffer.length}）`);
+    logger.info('claude-bridge', `收到主人私聊（未读 ${buffer.length}）`);
     scheduleFlush(Number(conf().debounceMs) || DEFAULT_DEBOUNCE_MS);
   };
+  if (raw.includes('[语音]') && entry.mid != null) {
+    fetchVoiceText(entry.mid).then((spoken) => {
+      if (spoken) logger.info('claude-bridge', `私聊语音转成文字（${spoken.length} 字）`);
+      pushLine(spoken ? raw.replace('[语音]', `[语音]说的是：${spoken}`) : raw);
+    }).catch(() => pushLine(raw));
+    return true;
+  }
   pushLine(
     /^\[文件/.test(raw) && entry.mid != null
-      ? `${raw}（消息号 ${entry.mid}，用 getfile.mjs 取下来再读）`
+      ? `${raw}（消息号 ${entry.mid}${fetchFileScript() ? '，用取文件脚本下下来再读' : ''}）`
       : raw
   );
   return true;   // 表示已接管，不要走原逻辑
@@ -1118,24 +1742,80 @@ export function available() {
   return { ok: true };
 }
 
-// ── 定时任务 ────────────────────────────────────────────────────────
-// 想让它每天定点干点什么，就在这儿挂一个 setInterval：activate 时启动、
-// deactivate 时清掉。别用 Windows 计划任务 —— 那个要管理员权限，会弹 UAC。
-// 参考写法：一分钟看一次时间，落在某个窗口里、当天还没跑过，就 spawn 一个后台脚本。
+// ── 每天定时跑一个脚本（可选）────────────────────────────────────────
+// 不用 Windows 计划任务，是因为那要管理员权限、会弹 UAC——半夜弹框不合适。
+// 挂在 QQ-agent 身上更简单：它开着定时器就在，重启后 activate 会重新起。
+// 用法：plugin.json 里配 cronScript（脚本绝对路径）+ cronTime（"20:00"），
+// 留空就整个功能不启用。日志和「今天跑过没」的戳都落在插件自己的状态目录。
+const CRON_STAMP = path.join(STATE_DIR, 'cron.last-run');
+const CRON_LOG = path.join(STATE_DIR, 'cron.log');
+const CRON_WINDOW_MIN = 30;      // 到点后这半小时内任一分钟触发都算
+let cronTimer = null;
+
+function stampToday() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+function cronAt() {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(conf().cronTime || '').trim());
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function cronTick() {
+  try {
+    const script = String(conf().cronScript || '').trim();
+    const at = cronAt();
+    if (!script || at == null) return;
+    const now = new Date();
+    const hhmm = now.getHours() * 60 + now.getMinutes();
+    if (hhmm < at || hhmm > at + CRON_WINDOW_MIN) return;
+    if (fs.existsSync(CRON_STAMP) && fs.readFileSync(CRON_STAMP, 'utf8').trim() === stampToday()) return;
+    fs.writeFileSync(CRON_STAMP, stampToday(), 'utf8');
+    if (busy) {
+      // 正跟主人聊着，别插一脚把两边都拖慢；明天再说
+      fs.appendFileSync(CRON_LOG, `[${now.toLocaleString('zh-CN')}] 在聊天，今天跳过\n`, 'utf8');
+      return;
+    }
+    const node = String(conf().cronNode || '').trim() || searchNode();
+    const child = spawn(node, [script], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+    fs.appendFileSync(CRON_LOG, `[${now.toLocaleString('zh-CN')}] 起了一轮\n`, 'utf8');
+    logger.info('claude-bridge', `到点了，开始跑 ${path.basename(script)}`);
+  } catch (e) {
+    try {
+      fs.appendFileSync(CRON_LOG, `[${new Date().toLocaleString('zh-CN')}] 出错：${e?.message ?? e}\n`, 'utf8');
+    } catch { /* 日志都写不进去就算了 */ }
+  }
+}
+
+function startCronTimer() {
+  if (cronTimer) return;
+  cronTimer = setInterval(cronTick, 60000);   // 一分钟看一次，够用
+  if (typeof cronTimer.unref === 'function') cronTimer.unref();
+}
+
+function stopCronTimer() {
+  if (cronTimer) { clearInterval(cronTimer); cronTimer = null; }
+}
 
 export function activate() {
   loadHistory();
   loadGroupHistory();
   if (install()) {
-    logger.info('claude-bridge', `已挂载：用户私聊交给 claude 回（只认 ${ownerIds().join(',')}），权限全开`);
+    logger.info('claude-bridge', `已挂载：主人私聊交给 claude 回（只认 ${ownerIds().join(',')}），权限全开`);
   }
+  startCronTimer();
 }
 
 export function deactivate() {
+  stopCronTimer();
   uninstall();
 }
 
 export function dispose() {
+  stopCronTimer();
   uninstall();
 }
 
