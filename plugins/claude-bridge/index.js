@@ -647,6 +647,49 @@ function archiveSession(id) {
   }
 }
 
+/**
+ * 这个会话现在到底占多长上下文 —— 只读文件尾巴那一小段。
+ *
+ * 别拿 `claude -p` 输出的 usage 当上下文长度：那是**这次运行所有 API 调用的累计**。
+ * 一轮里跑了十几次工具调用（搜网页、读笔记）就能累到几十上百万 token，被当成
+ * 「上下文撑爆了」，于是每干完一件大活儿就强制换新会话，聊过的内容全忘。
+ * 实测一边聊一边被清了六次，四万 token 的会话被判成一百八十三万。
+ *
+ * jsonl 里每条 assistant 记录带的是**那一次 API 调用**的 usage，
+ * input + cache_read + cache_creation 加起来就是那一刻的真实上下文。
+ * 取最后一条就够了，不用把大文件整个读进来。
+ */
+const SESSION_JSONL_TAIL = 512 * 1024;
+function sessionContextTokens(id) {
+  if (!id) return 0;
+  try {
+    const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
+    const projects = path.join(root, 'projects', homeDir().replace(/[^A-Za-z0-9]/g, '-'));
+    const file = path.join(projects, `${id}.jsonl`);
+    const size = fs.statSync(file).size;
+    if (!size) return 0;
+    const len = Math.min(size, SESSION_JSONL_TAIL);
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(len);
+    try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
+    const lines = buf.toString('utf8').split('\n');
+    // 从后往前找第一条能解析、带 usage 的记录；从中间截断的那行解析不过就跳过
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.startsWith('{')) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      const u = o?.message?.usage;
+      if (!u) continue;
+      const ctx = (Number(u.input_tokens) || 0)
+        + (Number(u.cache_read_input_tokens) || 0)
+        + (Number(u.cache_creation_input_tokens) || 0);
+      if (ctx > 0) return ctx;
+    }
+  } catch { /* 文件不在、格式变了：当拿不到，这轮就不判超限，宁可多聊几轮 */ }
+  return 0;
+}
+
 /** 这个聊天该用哪个会话。过期的当没有，返回新的。 */
 function sessionFor(key) {
   const rec = loadSessions()[key];
@@ -657,10 +700,11 @@ function sessionFor(key) {
   return fresh ? { id: rec.id, resume: true } : { id: randomUUID(), resume: false };
 }
 /** 这轮成功了：记一笔轮数。会话换了（重置）就重新计数。 */
-function markSession(key, id, promptTokens) {
+function markSession(key, id) {
   const map = loadSessions();
   const now = Date.now();
-  const ctx = Number(promptTokens) || 0;
+  // 真实上下文长度，不是这轮烧掉的 token（见 sessionContextTokens）
+  const ctx = sessionContextTokens(id);
   // 上下文已经撑得太长：这轮照常回完，下轮换个新会话从零起
   if (ctx > SESSION_TOKENS_MAX) {
     if (map[key]) {
@@ -850,12 +894,7 @@ function runClaude(prompt, timeoutMs, options = {}) {
           reject(new Error(`claude 退出码 ${code}：${err.slice(-200)}`));
           return;
         }
-        if (sess && options.sessionKey) {
-          const u = parsed.usage || {};
-          markSession(options.sessionKey, sess.id,
-            (Number(u.input_tokens) || 0) + (Number(u.cache_read_input_tokens) || 0)
-            + (Number(u.cache_creation_input_tokens) || 0));
-        }
+        if (sess && options.sessionKey) markSession(options.sessionKey, sess.id);
         resolve(body);
         return;
       }
