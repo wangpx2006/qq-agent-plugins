@@ -630,14 +630,35 @@ function saveSessions(map) {
 // 却一直堆在 claude 的 projects 目录里，翻历史的时候越堆越长。换掉时把它挪进
 // DATA_DIR/archived-sessions，只搬不删，想找回来随时能搬。
 const ARCHIVE_DIR = path.join(DATA_DIR, 'archived-sessions');
+/**
+ * 会话 jsonl 在哪。claude 按工作目录分文件夹，目录名不好猜 —— 群聊的 cwd 是
+ * 笔记库不是 home，按 home 拼出来的路径根本不存在。以前就是这样，群聊会话
+ * 一直归档不了，而且「读不到」和「不存在」看起来一模一样，谁也没发现。
+ * session id 是 UUID，全局唯一，干脆按文件名在 projects 下找。
+ */
+function findSessionFile(id) {
+  if (!id) return null;
+  const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
+  const projects = path.join(root, 'projects');
+  const name = `${id}.jsonl`;
+  try {
+    const direct = path.join(projects, homeDir().replace(/[^A-Za-z0-9]/g, '-'), name);
+    if (fs.existsSync(direct)) return direct;
+  } catch { /* 下面再找 */ }
+  try {
+    for (const d of fs.readdirSync(projects)) {
+      const p = path.join(projects, d, name);
+      if (fs.existsSync(p)) return p;
+    }
+  } catch { /* projects 目录都没有：当找不到 */ }
+  return null;
+}
+
 function archiveSession(id) {
   if (!id) return;
   try {
-    // claude 的目录名规则：工作目录里每个非字母数字字符都换成 -
-    const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
-    const projects = path.join(root, 'projects', homeDir().replace(/[^A-Za-z0-9]/g, '-'));
-    const src = path.join(projects, `${id}.jsonl`);
-    if (!fs.existsSync(src)) return;
+    const src = findSessionFile(id);
+    if (!src) return;
     fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
     fs.renameSync(src, path.join(ARCHIVE_DIR, `${id}.jsonl`));
     logger.info('claude-bridge', `旧会话归档了：${String(id).slice(0, 8)}`);
@@ -663,9 +684,8 @@ const SESSION_JSONL_TAIL = 512 * 1024;
 function sessionContextTokens(id) {
   if (!id) return 0;
   try {
-    const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
-    const projects = path.join(root, 'projects', homeDir().replace(/[^A-Za-z0-9]/g, '-'));
-    const file = path.join(projects, `${id}.jsonl`);
+    const file = findSessionFile(id);
+    if (!file) return 0;
     const size = fs.statSync(file).size;
     if (!size) return 0;
     const len = Math.min(size, SESSION_JSONL_TAIL);
