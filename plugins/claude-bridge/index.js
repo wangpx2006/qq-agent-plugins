@@ -20,12 +20,19 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { Orchestrator } from '../../src/orchestrator.js';
 import { logger } from '../../src/logger.js';
 import { DATA_DIR } from '../../src/config.js';
+// 纯函数单独一份，能脱机自测（selftest.mjs）
+// 带 ?v= 是因为宿主的「热重载」只重新 import 了入口文件，相对 import 走 ESM 缓存，
+// 改 pure.js 不重启永远读到旧的那份（报「does not provide an export named ...」）。
+// 以后改 pure.js 记得把这个版本号往上推。
+import { markImages, isPassReply, safeImageUrl, isPrivateHost } from './lib/pure.js?v=20261028';
 
 const PATCH_KEY = Symbol.for('qq-agent.claude-bridge.patch');
 const STATE_DIR = path.join(DATA_DIR, 'claude-bridge');
@@ -187,6 +194,17 @@ function homeDir() {
   return os.homedir();
 }
 
+/**
+ * shell: true 时 cmd.exe 会按空格重新拆参数，路径里有空格就成两段。
+ * 用户名带空格、或者装在 C:\Program Files 下都会踩到（issue #4 A2）。
+ * 只给确实含特殊字符的参数加双引号，普通 flag 保持原样。
+ */
+function quoteArg(v) {
+  const s = String(v);
+  if (!/[\s"&|<>^()]/.test(s)) return s;
+  return `"${s.replace(/"/g, '\\"')}"`;
+}
+
 // ── 历史 ────────────────────────────────────────────────────────────
 function loadHistory() {
   try {
@@ -236,6 +254,11 @@ const MARK_HEAD = '@+[ \\t]*[_·]?[ \\t]*@+';
 const STICKER_RE = new RegExp(`${MARK_HEAD}\\s*表情\\s*[:：]\\s*([^@\\n]+?)\\s*@+`);
 const COLLECT_RE = new RegExp(`${MARK_HEAD}\\s*收藏\\s*[:：]\\s*([^@\\n]*)@*`);
 const INCOMING_DIR = path.join(STATE_DIR, 'incoming');
+// 图片大小上限：群图和私聊收到的图共用一个口子。
+// 2026-10-26 主人：「让群里的你也能看图」。原来卡 3MB，可 QQ 原图动辄五六兆
+// （实测一张 6.1MB 的街拍照直接被丢，群里只剩一个「[图片]」占位）。
+// Read 读 6MB 的 jpg 没问题，放到 12MB。
+const GROUP_MEDIA_MAX_BYTES = 12 * 1024 * 1024;
 
 function extractSticker(text) {
   const raw = String(text || '');
@@ -330,15 +353,16 @@ async function downloadIncoming(entry) {
   const url = String(img?.url || '');
   if (!/^https?:\/\//i.test(url)) return '';
   try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const res = await fetchImage(url, 20000);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error('空文件');
+    if (buf.length > GROUP_MEDIA_MAX_BYTES) throw new Error(`${buf.length} 字节，超过上限 ${GROUP_MEDIA_MAX_BYTES}`);
     fs.mkdirSync(INCOMING_DIR, { recursive: true });
     const name = String(entry.mid ?? Date.now()).replace(/[^\w-]/g, '_');
     // 以前一律存 .img，Read 认不出扩展名就不当成图。按真实格式给名字。
     const dest = path.join(INCOMING_DIR, `${name}.${imageExt(buf, img?.file)}`);
     fs.writeFileSync(dest, buf);
+    pruneDir(INCOMING_DIR, GROUP_MEDIA_KEEP_MS);   // 私聊这份以前从不清理，会一直长
     return dest;
   } catch (error) {
     logger.warn('claude-bridge', `图片没下下来：${error?.message ?? error}`);
@@ -573,12 +597,16 @@ function recordUsage(parsed, chatKey) {
 // 隔 SESSION_TTL_MS 没说话。前者防上下文无限膨胀，后者防缓存早就过期了还在硬续。
 const SESSION_FILE = path.join(STATE_DIR, 'claude-sessions.json');
 const SESSION_TURNS_MAX = 200;
-// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十二万 token 过一遍也慢。
+// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十几万 token 过一遍也慢。
 //
-// 这个数必须卡在 claude 自己的自动压缩阈值之前（settings 里的
+// 这个数必须卡在 claude 自己的自动压缩之前（settings 里的
 // CLAUDE_CODE_MAX_CONTEXT_TOKENS），否则历史会先被压成摘要，之前交代的规矩和
-// 印象全走样。按 131072 算，留 1 万左右余量给最后那一轮。
-const SESSION_TOKENS_MAX = 120000;
+// 印象全走样。
+// 两条线还需要错开：插件是「这轮回完」才看长度，CLI 是「下一轮开始」就压，
+// 都设 120000 的话压缩永远先发生，插件这条等于白设。所以插件压到 11 万，
+// CLI 留 12 万兜底。
+const SESSION_TOKENS_MAX = 110000;
+const SESSION_AUTOCOMPACT = 120000;
 const SESSION_TTL_MS = 24 * 3600 * 1000;
 // 外部主动发出去的消息（history 里带 ext: true），多久之内的还补进 prompt。
 const EXT_ECHO_MS = 6 * 3600 * 1000;
@@ -606,14 +634,35 @@ function saveSessions(map) {
 // 却一直堆在 claude 的 projects 目录里，翻历史的时候越堆越长。换掉时把它挪进
 // DATA_DIR/archived-sessions，只搬不删，想找回来随时能搬。
 const ARCHIVE_DIR = path.join(DATA_DIR, 'archived-sessions');
+/**
+ * 会话 jsonl 在哪。claude 按工作目录分文件夹，目录名不好猜 —— 群聊的 cwd 是
+ * 笔记库不是 home，按 home 拼出来的路径根本不存在。以前就是这样，群聊会话
+ * 一直归档不了，而且「读不到」和「不存在」看起来一模一样，谁也没发现。
+ * session id 是 UUID，全局唯一，干脆按文件名在 projects 下找。
+ */
+function findSessionFile(id) {
+  if (!id) return null;
+  const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
+  const projects = path.join(root, 'projects');
+  const name = `${id}.jsonl`;
+  try {
+    const direct = path.join(projects, homeDir().replace(/[^A-Za-z0-9]/g, '-'), name);
+    if (fs.existsSync(direct)) return direct;
+  } catch { /* 下面再找 */ }
+  try {
+    for (const d of fs.readdirSync(projects)) {
+      const p = path.join(projects, d, name);
+      if (fs.existsSync(p)) return p;
+    }
+  } catch { /* projects 目录都没有：当找不到 */ }
+  return null;
+}
+
 function archiveSession(id) {
   if (!id) return;
   try {
-    // claude 的目录名规则：工作目录里每个非字母数字字符都换成 -
-    const root = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), '.claude');
-    const projects = path.join(root, 'projects', homeDir().replace(/[^A-Za-z0-9]/g, '-'));
-    const src = path.join(projects, `${id}.jsonl`);
-    if (!fs.existsSync(src)) return;
+    const src = findSessionFile(id);
+    if (!src) return;
     fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
     fs.renameSync(src, path.join(ARCHIVE_DIR, `${id}.jsonl`));
     logger.info('claude-bridge', `旧会话归档了：${String(id).slice(0, 8)}`);
@@ -621,6 +670,48 @@ function archiveSession(id) {
     // 正被 claude 进程占着、或者路径对不上：这轮搬不动就下轮再搬，绝不影响聊天
     logger.warn('claude-bridge', `归档没成（不影响聊天）：${e?.message ?? e}`);
   }
+}
+
+/**
+ * 这个会话现在到底占多长上下文 —— 只读文件尾巴那一小段。
+ *
+ * 别拿 `claude -p` 输出的 usage 当上下文长度：那是**这次运行所有 API 调用的累计**。
+ * 一轮里跑了十几次工具调用（搜网页、读笔记）就能累到几十上百万 token，被当成
+ * 「上下文撑爆了」，于是每干完一件大活儿就强制换新会话，聊过的内容全忘。
+ * 实测一边聊一边被清了六次，四万 token 的会话被判成一百八十三万。
+ *
+ * jsonl 里每条 assistant 记录带的是**那一次 API 调用**的 usage，
+ * input + cache_read + cache_creation 加起来就是那一刻的真实上下文。
+ * 取最后一条就够了，不用把大文件整个读进来。
+ */
+const SESSION_JSONL_TAIL = 512 * 1024;
+function sessionContextTokens(id) {
+  if (!id) return 0;
+  try {
+    const file = findSessionFile(id);
+    if (!file) return 0;
+    const size = fs.statSync(file).size;
+    if (!size) return 0;
+    const len = Math.min(size, SESSION_JSONL_TAIL);
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(len);
+    try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
+    const lines = buf.toString('utf8').split('\n');
+    // 从后往前找第一条能解析、带 usage 的记录；从中间截断的那行解析不过就跳过
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.startsWith('{')) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      const u = o?.message?.usage;
+      if (!u) continue;
+      const ctx = (Number(u.input_tokens) || 0)
+        + (Number(u.cache_read_input_tokens) || 0)
+        + (Number(u.cache_creation_input_tokens) || 0);
+      if (ctx > 0) return ctx;
+    }
+  } catch { /* 文件不在、格式变了：当拿不到，这轮就不判超限，宁可多聊几轮 */ }
+  return 0;
 }
 
 /** 这个聊天该用哪个会话。过期的当没有，返回新的。 */
@@ -633,10 +724,11 @@ function sessionFor(key) {
   return fresh ? { id: rec.id, resume: true } : { id: randomUUID(), resume: false };
 }
 /** 这轮成功了：记一笔轮数。会话换了（重置）就重新计数。 */
-function markSession(key, id, promptTokens) {
+function markSession(key, id) {
   const map = loadSessions();
   const now = Date.now();
-  const ctx = Number(promptTokens) || 0;
+  // 真实上下文长度，不是这轮烧掉的 token（见 sessionContextTokens）
+  const ctx = sessionContextTokens(id);
   // 上下文已经撑得太长：这轮照常回完，下轮换个新会话从零起
   if (ctx > SESSION_TOKENS_MAX) {
     if (map[key]) {
@@ -668,6 +760,9 @@ function dropSession(key) {
   }
 }
 
+// --max-turns 是隐藏参数，CLI 哪天不认了就别再传（见 runClaude 里的注释）。
+let maxTurnsDropped = false;
+
 function runClaude(prompt, timeoutMs, options = {}) {
   return new Promise((resolve, reject) => {
     let child;
@@ -685,7 +780,30 @@ function runClaude(prompt, timeoutMs, options = {}) {
       // JSON，正文在 result 字段里；解析失败就退回原来的纯文本处理，不会因为
       // 版本差异把聊天弄哑。
       sess = options.sessionKey ? sessionFor(options.sessionKey) : null;
-      const args = ['-p', '--output-format', 'json', '--max-turns', options.maxTurns || MAX_TURNS, '--permission-mode', 'bypassPermissions'];
+
+      // 权限（2026-10-28 issue #1）：
+      // 私聊那个号只有主人自己用，权限全开 —— 后台跑没人能点「允许」，留默认模式等于工具全被拒。
+      // 群聊不一样：群里谁都能说话，而 Read 能读任意绝对路径，「凭据不给」原来只写在提示词里。
+      // 现在群聊改成默认权限模式 + 无人应答即拒，越界的默认结局是工具层直接拒掉
+      // （实测报「Path is outside allowed working directories」），不再靠模型自觉。
+      // ⚠️ 别把 Read/Grep/Glob 塞进 --allowedTools：实测一放行 Read，路径限制就一起没了。
+      const permArgs = options.group
+        ? ['--permission-mode', 'default', '--permission-prompts', 'none',
+           '--allowedTools', 'mcp__search__web_search,mcp__search__fetch_page']
+        : ['--permission-mode', 'bypassPermissions'];
+
+      // --max-turns 是隐藏参数（--help 里没有，当前版本却认）。哪天被移除，整条命令会直接报
+      // unknown option；这里见到一次就置位，后面不再传，别让每一轮都失败。
+      const turnArgs = maxTurnsDropped ? [] : ['--max-turns', String(options.maxTurns || MAX_TURNS)];
+
+      const args = ['-p', '--output-format', 'json', ...turnArgs, ...permArgs];
+
+      // 系统提示里的 cwd / 环境 / git 状态每轮都在变，会把缓存前缀打碎，挪到第一条 user 消息里。
+      // 只在用默认系统提示时生效（传了 --system-prompt-file 会被忽略，无害）。
+      args.push('--exclude-dynamic-system-prompt-sections');
+      // 自动压缩阈值自己传，别再靠外部环境变量（issue #4 B）。比 SESSION_TOKENS_MAX 高
+      // 一档，只在插件没来得及换会话时兜底。
+      args.push('--autocompact', `${Math.round(SESSION_AUTOCOMPACT / 1000)}k`);
       if (sess) args.push(sess.resume ? '--resume' : '--session-id', sess.id);
       else args.push('--no-session-persistence');
 
@@ -725,10 +843,21 @@ function runClaude(prompt, timeoutMs, options = {}) {
         }
       } catch { /* 建不出来就照旧带上 MCP，顶多贵一点 */ }
 
-      child = spawn(claudeCmd(), args, {
+      // 群聊的「工作目录」就是允许它翻的那几个目录：cwd 给第一个，剩下的用 --add-dir 追加。
+      // 放在 args 最后是因为 --add-dir 是变长参数，后面不能再跟别的 flag。
+      let workCwd = options.cwd || homeDir();
+      if (options.group) {
+        const dirs = memoryDirs().filter((d) => {
+          try { return fs.statSync(d).isDirectory(); } catch { return false; }
+        });
+        workCwd = dirs[0] || STATE_DIR;
+        if (dirs.length > 1) args.push('--add-dir', ...dirs.slice(1));
+      }
+
+      child = spawn(quoteArg(claudeCmd()), args.map(quoteArg), {
         shell: true,
         windowsHide: true,
-        cwd: homeDir(),
+        cwd: workCwd,
         env: { ...process.env },
       });
     } catch (e) {
@@ -751,6 +880,12 @@ function runClaude(prompt, timeoutMs, options = {}) {
     const onClose = (code) => {
       clearTimeout(timer);
       const text = String(out || '').trim();
+
+      // 参数不认了要报得像参数不认了，别被兜底话术盖成「我这边卡了一下」。
+      if (!maxTurnsDropped && /unknown option|unrecognized option|Unknown argument/i.test(err + text)) {
+        maxTurnsDropped = true;
+        logger.warn('claude-bridge', '本机 CLI 不认 --max-turns 了，之后不再传这个参数');
+      }
 
       // --output-format json：正常返回就一行 JSON，正文在 result、token 数在 usage。
       // 顺手记一笔账，面板那边才看得见 QQ 里花的量。
@@ -784,12 +919,7 @@ function runClaude(prompt, timeoutMs, options = {}) {
           reject(new Error(`claude 退出码 ${code}：${err.slice(-200)}`));
           return;
         }
-        if (sess && options.sessionKey) {
-          const u = parsed.usage || {};
-          markSession(options.sessionKey, sess.id,
-            (Number(u.input_tokens) || 0) + (Number(u.cache_read_input_tokens) || 0)
-            + (Number(u.cache_creation_input_tokens) || 0));
-        }
+        if (sess && options.sessionKey) markSession(options.sessionKey, sess.id);
         resolve(body);
         return;
       }
@@ -1213,11 +1343,15 @@ function groupSys() {
   ].join('\n');
 }
 
-// ── 语音：借 QQ 自己的语音转文字 ──────────────────────────────────────
-// 主人 2026-10-24 问「能不能直接用 qq 自带的语音转文字」。能——snowluma 实现了
-// NapCat 那套 `fetch_ptt_text`：把消息里的 record 段交给 QQ 自己的 pttTrans 接口，
-// 拿回腾讯转好的文字。不装 whisper、不转码、音频也不落地，代价只是走一次腾讯服务端。
-// ⚠️ 它的硬限制是「语音得还在本机缓存里」，所以收到就得转，不能等合并窗口过去再说。
+// ── 语音：核心先转，转不了再借 QQ 自己的转写兜底 ──────────────────────
+// 主路：核心 src/onebot.js 的 segmentsToText 遇到 record 段会找 `media.transcribe`
+// 提供者（voice-transcribe 注册的就是它），转成功的语音进来时已经是「[语音转文字] xxx」，
+// 压根不会走到这里 —— 只有本地识别没装、或者识别失败时才留下光秃秃的「[语音]」。
+// 兜底：这时候再问一次 QQ 自己的 pttTrans（snowluma 的 fetch_ptt_text）。
+// 代价是走一次腾讯服务端；语音得还在本机缓存里，所以收到就得转，不能等合并窗口过去。
+//
+// 2026-10-28 备注：一度以为这条路是死的（怀疑 message_id 是哈希串、Number() 得 NaN），
+// 实际查 data/sessions 里的记录，mid 是 `827771959` 这种真数字，Number 没问题 —— 留着。
 function onebotHttp() {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'config.json'), 'utf8'));
@@ -1241,8 +1375,7 @@ async function fetchVoiceText(mid) {
     });
     const j = await res.json();
     if (j?.status !== 'ok') {
-      // 2026-10-25：之前把失败整个吞了，群里只看到「没转出来」，查半天才知道
-      // 是腾讯服务端拒的（errCode 4294966146 之类）。原因留在这儿，下次一眼能看见。
+      // 失败原因留在这儿，下次一眼能看见（腾讯那边拒的时候只有 retcode）。
       logger.warn('claude-bridge', `语音转写被拒：retcode=${j?.retcode} ${String(j?.wording || j?.message || '').slice(0, 120)}`);
       return '';
     }
@@ -1261,24 +1394,51 @@ async function fetchVoiceText(mid) {
 // 模型手上有 Read，读本地图就能看见；不想看就不读，一分钱不花。
 // 注意别改成「自动 Read」——群里连发表情包会把 token 烧穿。
 const GROUP_MEDIA_DIR = path.join(STATE_DIR, 'media');
-// 2026-10-26 主人：「让群里的你也能看图」。
-// 原来卡 3MB，可 QQ 原图动辄五六兆（实测一张 6.1MB 的街拍照直接被丢，
-// 群里就只剩一个「[图片]」占位）。Read 读 6MB 的 jpg 没问题，放到 12MB。
-const GROUP_MEDIA_MAX_BYTES = 12 * 1024 * 1024;
 const GROUP_MEDIA_MAX_COUNT = 3;
 const GROUP_MEDIA_KEEP_MS = 24 * 3600 * 1000;
+const MEDIA_MAX_REDIRECTS = 3;
 
-/** 只放行公网 http(s)：群里谁能发消息，谁就能塞 url，别让它去戳本机或内网。 */
-function safeImageUrl(raw) {
-  try {
-    const u = new URL(String(raw));
-    if (!/^https?:$/.test(u.protocol)) return false;
-    const h = u.hostname.toLowerCase();
-    if (h === 'localhost' || h.endsWith('.local')) return false;
-    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h)) return false;
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
-    return true;
-  } catch { return false; }
+/**
+ * 地址过一遍完整校验：协议、字面量 IP、DNS 解析后的 IP。
+ * 2026-10-28 issue #2：域名（比如 127.0.0.1.nip.io）光看字符串判不出来，得真解析。
+ * 解析之后再发请求存在 rebinding 的窗口，这里不做 pin-IP，代价太大，属于已知残余风险。
+ */
+async function checkImageUrl(raw) {
+  let u;
+  try { u = new URL(String(raw)); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  if (!safeImageUrl(u.href)) return null;
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (!net.isIP(host)) {
+    try {
+      const addrs = await dns.promises.lookup(host, { all: true });
+      if (!addrs.length || addrs.some((a) => isPrivateHost(a.address))) return null;
+    } catch { return null; }
+  }
+  return u;
+}
+
+/**
+ * 取图的唯一入口：手动跟重定向，每一跳都重新校验。
+ * 以前直接 fetch 默认 follow，第一跳是公网的图，第二跳 302 到 127.0.0.1 就进本机了。
+ */
+async function fetchImage(raw, timeoutMs) {
+  let cur = String(raw);
+  for (let hop = 0; hop <= MEDIA_MAX_REDIRECTS; hop++) {
+    const u = await checkImageUrl(cur);
+    if (!u) throw new Error(`不安全的地址，拒了：${String(cur).slice(0, 120)}`);
+    const res = await fetch(u.href, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) throw new Error(`重定向没给 location（HTTP ${res.status}）`);
+      try { await res.body?.cancel(); } catch { /* 断不断无所谓 */ }
+      cur = new URL(loc, u).href;
+      continue;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res;
+  }
+  throw new Error(`重定向超过 ${MEDIA_MAX_REDIRECTS} 跳`);
 }
 
 function imageExt(buf, hint) {
@@ -1290,18 +1450,19 @@ function imageExt(buf, hint) {
   return m ? m[1].toLowerCase() : 'jpg';
 }
 
-/** 目录别无限长大：顺手把一天前的删掉。 */
-function pruneMediaDir() {
+/** 目录别无限长大：删掉超过 keepMs 的文件。群图和私聊收到的图共用这一套。 */
+function pruneDir(dir, keepMs) {
   try {
     const now = Date.now();
-    for (const n of fs.readdirSync(GROUP_MEDIA_DIR)) {
-      const p = path.join(GROUP_MEDIA_DIR, n);
+    for (const n of fs.readdirSync(dir)) {
+      const p = path.join(dir, n);
       try {
-        if (now - fs.statSync(p).mtimeMs > GROUP_MEDIA_KEEP_MS) fs.unlinkSync(p);
+        if (now - fs.statSync(p).mtimeMs > keepMs) fs.unlinkSync(p);
       } catch { /* 单个删不掉无所谓 */ }
     }
   } catch { /* 目录还没有就还没有 */ }
 }
+function pruneMediaDir() { pruneDir(GROUP_MEDIA_DIR, GROUP_MEDIA_KEEP_MS); }
 
 /**
  * 把一条消息里的图落地。
@@ -1310,16 +1471,18 @@ function pruneMediaDir() {
  */
 async function grabImages(entry) {
   const media = Array.isArray(entry?.media) ? entry.media : [];
-  const imgs = media
-    .filter((m) => m && m.kind === 'image' && safeImageUrl(m.url))
-    .slice(0, GROUP_MEDIA_MAX_COUNT);
+  const imgs = media.filter((m) => m && m.kind === 'image');
   if (!imgs.length) return [];
   try { fs.mkdirSync(GROUP_MEDIA_DIR, { recursive: true }); } catch { /* 建不了目录就放弃 */ }
-  const out = [];
-  for (const m of imgs) {
+  // 返回值和 imgs 一一对应，失败（地址被拦 / 下载出错 / 超限）的位置留 null。
+  // 以前失败就 continue 把数组压短，markImages 再按顺序填 —— 第 1 张失败时，
+  // 第 2 张的路径会被贴到第 1 个 [图片] 上，模型拿着错图说事（issue #3）。
+  const out = new Array(imgs.length).fill(null);
+  for (let i = 0; i < imgs.length && i < GROUP_MEDIA_MAX_COUNT; i++) {
+    const m = imgs[i];
+    if (!safeImageUrl(m.url)) continue;
     try {
-      const res = await fetch(String(m.url), { signal: AbortSignal.timeout(20000) });
-      if (!res.ok) { logger.warn('claude-bridge', `群图下载失败：HTTP ${res.status}`); continue; }
+      const res = await fetchImage(String(m.url), 20000);
       const buf = Buffer.from(await res.arrayBuffer());
       if (!buf.length || buf.length > GROUP_MEDIA_MAX_BYTES) {
         logger.warn('claude-bridge', `群图跳过：${buf.length} 字节，上限 ${GROUP_MEDIA_MAX_BYTES}`);
@@ -1327,23 +1490,11 @@ async function grabImages(entry) {
       }
       const file = path.join(GROUP_MEDIA_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${imageExt(buf, m.file)}`);
       fs.writeFileSync(file, buf);
-      out.push({ file, summary: String(m.summary || '').slice(0, 40), size: buf.length });
+      out[i] = { file, summary: String(m.summary || '').slice(0, 40), size: buf.length };
     } catch (e) { logger.warn('claude-bridge', `群图下载异常：${e?.message ?? e}`); }
   }
   pruneMediaDir();
   return out;
-}
-
-/** 把 `[图片]` 逐个换成带本地路径的说明；没下到的保持原样。 */
-function markImages(text, got) {
-  if (!got?.length) return text;
-  let i = 0;
-  return String(text).replace(/\[图片\]/g, () => {
-    const g = got[i++];
-    if (!g) return '[图片]';
-    const tag = g.summary ? `「${g.summary}」` : '';
-    return `[图片${tag}，本地文件：${g.file}]`;
-  });
 }
 
 let groupHistory = [];       // 跟私聊的 history 完全分开，不串味
@@ -1501,7 +1652,8 @@ function buildGroupPrompt(lines) {
     parts.push('有人在叫你，你得出声，不能沉默。');
   } else {
     parts.push('没人叫你。想插一句就插，就说你在乎的那个点；插不上、或者插了也是废话，就只回 PASS 一个词，我这边不会发出去。');
-    parts.push('连着几句都是别人在讲自己的事，那就 PASS，别硬找话。');
+    parts.push('别人明显在跟另一个人一问一答、或者纯属他们自己的私事，你就听着；'
+      + '其余时候想接就接一句，别自己把自己劝退。');
   }
   // 2026-10-25 群友问「你会不会用表情包了」，我只会说「发不出去」——
   // 因为群里这条路压根没接上：私聊有 @@表情:id@@ 那一整套，群里只把标记刮掉了。
@@ -1523,12 +1675,6 @@ function buildGroupPrompt(lines) {
   return parts.join('\n');
 }
 
-/** 模型判断这场不值得插嘴时会只回一个 PASS。别当话发出去。 */
-function isPassReply(parts) {
-  const flat = parts.join('').replace(/[^\p{L}]/gu, '');
-  return !flat || /^pass$/iu.test(flat);
-}
-
 async function groupFlush() {
   if (groupBusy || !groupBuffer.length) return;
   // 攒了几分钟再看时 buffer 可能很长，只取最后几条 —— 更早的都过时了，多带纯烧钱
@@ -1542,6 +1688,7 @@ async function groupFlush() {
       tools: GROUP_TOOLS,
       maxTurns: GROUP_MAX_TURNS,
       search: true,
+      group: true,          // 群聊走受限权限：工作目录外的读写由工具层直接拒（issue #1）
       chatKey: groupChatKey,
       sessionKey: groupChatKey,
     });
@@ -1633,7 +1780,7 @@ function handleGroup(orch, chatKey, entry) {
     scheduleGroupFlush();
   };
 
-  // 语音要趁还在缓存里马上转；图也有时效（url 带 rkey），都是收到就先处理再去排队。
+  // 图有时效（url 带 rkey），语音得还在本机缓存里 —— 都是收到就先处理再去排队。
   const hasVoice = text.includes('[语音]') && entry?.mid != null;
   const hasImage = Array.isArray(entry?.media) && entry.media.some((m) => m && m.kind === 'image');
   if (!hasVoice && !hasImage) {
@@ -1646,9 +1793,10 @@ function handleGroup(orch, chatKey, entry) {
     hasImage ? grabImages(entry) : Promise.resolve([]),
     hasVoice ? fetchVoiceText(entry.mid) : Promise.resolve(''),
   ]).then(([got, spoken]) => {
-    if (got.length) {
+    const saved = got.filter(Boolean).length;
+    if (saved) {
       line.text = markImages(line.text, got);
-      logger.info('claude-bridge', `群里存下图（${name}，${got.length} 张）`);
+      logger.info('claude-bridge', `群里存下图（${name}，${saved} 张）`);
     } else if (hasImage) {
       logger.warn('claude-bridge', `群里的图没下下来（${name}），按 [图片] 占位处理`);
     }
@@ -1734,6 +1882,7 @@ function handle(orch, chatKey, entry) {
     scheduleFlush(Number(conf().debounceMs) || DEFAULT_DEBOUNCE_MS);
   };
   if (raw.includes('[语音]') && entry.mid != null) {
+    // 核心没转出来（没装本地识别，或者识别失败），再问一次 QQ 自己的转写
     fetchVoiceText(entry.mid).then((spoken) => {
       if (spoken) logger.info('claude-bridge', `私聊语音转成文字（${spoken.length} 字）`);
       pushLine(spoken ? raw.replace('[语音]', `[语音]说的是：${spoken}`) : raw);
