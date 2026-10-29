@@ -597,12 +597,16 @@ function recordUsage(parsed, chatKey) {
 // 隔 SESSION_TTL_MS 没说话。前者防上下文无限膨胀，后者防缓存早就过期了还在硬续。
 const SESSION_FILE = path.join(STATE_DIR, 'claude-sessions.json');
 const SESSION_TURNS_MAX = 200;
-// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十二万 token 过一遍也慢。
+// 上下文涨到这么大就主动断一次。缓存再便宜，每轮把十几万 token 过一遍也慢。
 //
-// 这个数必须卡在 claude 自己的自动压缩阈值之前（settings 里的
+// 这个数必须卡在 claude 自己的自动压缩之前（settings 里的
 // CLAUDE_CODE_MAX_CONTEXT_TOKENS），否则历史会先被压成摘要，之前交代的规矩和
-// 印象全走样。按 131072 算，留 1 万左右余量给最后那一轮。
-const SESSION_TOKENS_MAX = 120000;
+// 印象全走样。
+// 两条线还需要错开：插件是「这轮回完」才看长度，CLI 是「下一轮开始」就压，
+// 都设 120000 的话压缩永远先发生，插件这条等于白设。所以插件压到 11 万，
+// CLI 留 12 万兜底。
+const SESSION_TOKENS_MAX = 110000;
+const SESSION_AUTOCOMPACT = 120000;
 const SESSION_TTL_MS = 24 * 3600 * 1000;
 // 外部主动发出去的消息（history 里带 ext: true），多久之内的还补进 prompt。
 const EXT_ECHO_MS = 6 * 3600 * 1000;
@@ -797,8 +801,9 @@ function runClaude(prompt, timeoutMs, options = {}) {
       // 系统提示里的 cwd / 环境 / git 状态每轮都在变，会把缓存前缀打碎，挪到第一条 user 消息里。
       // 只在用默认系统提示时生效（传了 --system-prompt-file 会被忽略，无害）。
       args.push('--exclude-dynamic-system-prompt-sections');
-      // 自动压缩阈值跟 SESSION_TOKENS_MAX 对齐，别再靠外部环境变量（issue #4 B）。
-      args.push('--autocompact', `${Math.round(SESSION_TOKENS_MAX / 1000)}k`);
+      // 自动压缩阈值自己传，别再靠外部环境变量（issue #4 B）。比 SESSION_TOKENS_MAX 高
+      // 一档，只在插件没来得及换会话时兜底。
+      args.push('--autocompact', `${Math.round(SESSION_AUTOCOMPACT / 1000)}k`);
       if (sess) args.push(sess.resume ? '--resume' : '--session-id', sess.id);
       else args.push('--no-session-persistence');
 
