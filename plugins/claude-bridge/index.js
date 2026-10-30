@@ -113,6 +113,11 @@ function sys() {
   '「喵」要主动带：几句里来一个，或者单甩一个「喵」都行。别句句挂，但别一整段一个都不带。',
   '你在这台电脑上有权限执行命令、读写文件。但删东西、改系统设置、往外边发东西这类收不回来的事，' +
     '先跟主人说一声再动手，别自己拍板；日常查一查、看一眼、整理整理可以直接做。',
+  // 表情包自主收藏是个坑：工具描述里只要留一点「偶尔用」的口子，模型就会自己看着好玩收一张。
+  // 写死成只认明确指令。
+  '收藏表情包：只有主人明确说了「收下」「收藏这个」「存起来」这一类话才可以用 collect_sticker，' +
+    '而且只收他指的那一张。觉得好看、好玩、以后用得上，都不算理由，' +
+    '不许自己判断，也不许先收了再报备。真遇到特别想留的，问一句「这张要不要收下」，等点头再动。',
   '装东西一律先报备：再小的也算（npm 包、扩展、命令行工具）。先说清它是什么、拿来干什么、装在哪多大、能不能卸干净，' +
     '然后停下来等主人点头。他没明确说「装」就别装，别用「我先装上了」代替商量。',
   // ── 下面这几条是「把你的某个固定流程写进 prompt」的写法示例，按需改写或删掉 ──
@@ -425,7 +430,8 @@ function buildPrompt(lines, chatKey) {
   // 规矩和表情菜单都是常量，只在新建会话的那一轮塞一次。续会话时 claude 自己记得，
   // 每轮再塞一遍等于每轮多付几千 token，而且都压在消息末尾、吃不到前缀缓存。
   // 实测：私聊会话每轮固定多花 4400 token，二十来轮就被迫重开。
-  const firstTurn = !chatKey || !USE_SESSION || !sessionFor(chatKey).resume;
+  const sess = chatKey && USE_SESSION ? sessionFor(chatKey) : null;
+  const firstTurn = !sess || !sess.resume;
   const parts = [];
   if (firstTurn) {
     parts.push('【主人给你定的固定规则，优先级最高，必须遵守】', sys());
@@ -480,6 +486,22 @@ function buildPrompt(lines, chatKey) {
   }
   parts.push('', '主人刚发来：');
   for (const l of lines) parts.push(`主人：${renderFaces(l)}`);
+  // 上下文快到上限：这轮要是还接着干长活，先落盘。加在历史之后、消息末尾，
+  // 不会把前缀缓存顶开；放「回这一条」前面，免得把最后的动作指令冲淡。
+  if (sess?.resume) {
+    const ctx = sessionContextTokens(sess.id);
+    if (ctx > SESSION_WARN_TOKENS) {
+      parts.push(
+        '',
+        `【提醒】这个会话上下文已经 ${Math.round(ctx / 1000)}k token，`
+          + `到 ${Math.round(SESSION_TOKENS_MAX / 1000)}k 就整段换新会话，`
+          + `中间压缩一次也会丢掉细节。这轮如果要连着翻文件、改东西，`
+          + `先把进度写进 ${WORK_DIR} 下的一个 md：已经做完什么、剩下什么、关键结论和文件路径。`
+          + `换会话之后你只剩这个文件能接上，别指望自己记得。`
+          + `只是聊天就不用管这条。`,
+      );
+    }
+  }
   parts.push('', '回这一条。');
   return parts.join('\n');
 }
@@ -607,6 +629,13 @@ const SESSION_TURNS_MAX = 200;
 // CLI 留 12 万兜底。
 const SESSION_TOKENS_MAX = 110000;
 const SESSION_AUTOCOMPACT = 120000;
+// 上下文到这儿就开始催存档。2026-10-30 主人问「私聊干复杂活触发压缩咋办」，
+// 答案是压缩不会崩，但会忘掉干到哪、哪些改了哪些没改。留两万 token 的余量，
+// 够它把进度写完再接着干。别写死 90000：上限哪天调了，按余量算才跟得上。
+const SESSION_WARN_TOKENS = SESSION_TOKENS_MAX - 20000;
+// 存档落哪儿：主人不在的时候也得有地方写。插件只负责建目录，内容让模型自己管。
+const WORK_DIR = path.join(homeDir(), '_work');
+try { fs.mkdirSync(WORK_DIR, { recursive: true }); } catch { /* 建不出来就让模型自己 mkdir */ }
 const SESSION_TTL_MS = 24 * 3600 * 1000;
 // 外部主动发出去的消息（history 里带 ext: true），多久之内的还补进 prompt。
 const EXT_ECHO_MS = 6 * 3600 * 1000;
@@ -1628,7 +1657,11 @@ function buildGroupPrompt(lines) {
   const parts = firstTurn ? ['【群聊，不是私聊。下面这些是硬规矩】', groupSys()] : [];
   // 印象卡是别的模型整理的，会过时也会记错，所以只说「参考」；更要紧的是别照着它
   // 主动往外说 —— 里面记着人家的账号糟心事、证件，群里说出来是要出事的。
-  const impressions = loadImpressions(groupChatKey);
+  //
+  // 2026-10-30 主人翻会话记录发现：私聊那边印象卡只在首轮塞，群聊这边每轮都塞，
+  // 每轮多付约 500 token 全价（压在消息末尾，吃不到前缀缓存）。改成跟私聊对齐。
+  // 印象卡本身几小时才更新一次，一个会话撑不到那么久就换新的了，不会漏。
+  const impressions = firstTurn ? loadImpressions(groupChatKey) : '';
   if (impressions) {
     parts.push(
       '',
