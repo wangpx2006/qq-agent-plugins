@@ -358,10 +358,7 @@ async function downloadIncoming(entry) {
   const url = String(img?.url || '');
   if (!/^https?:\/\//i.test(url)) return '';
   try {
-    const res = await fetchImage(url, 20000);
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (!buf.length) throw new Error('空文件');
-    if (buf.length > GROUP_MEDIA_MAX_BYTES) throw new Error(`${buf.length} 字节，超过上限 ${GROUP_MEDIA_MAX_BYTES}`);
+    const buf = await fetchImage(url, 20000);
     fs.mkdirSync(INCOMING_DIR, { recursive: true });
     const name = String(entry.mid ?? Date.now()).replace(/[^\w-]/g, '_');
     // 以前一律存 .img，Read 认不出扩展名就不当成图。按真实格式给名字。
@@ -876,10 +873,8 @@ function runClaude(prompt, timeoutMs, options = {}) {
       // 放在 args 最后是因为 --add-dir 是变长参数，后面不能再跟别的 flag。
       let workCwd = options.cwd || homeDir();
       if (options.group) {
-        const dirs = memoryDirs().filter((d) => {
-          try { return fs.statSync(d).isDirectory(); } catch { return false; }
-        });
-        workCwd = dirs[0] || STATE_DIR;
+        const dirs = [...new Set([...groupMemoryDirs(), groupMediaDir()])];
+        workCwd = dirs[0];
         if (dirs.length > 1) args.push('--add-dir', ...dirs.slice(1));
       }
 
@@ -1290,8 +1285,33 @@ function memoryDirs() {
   return out.length ? out : [path.join(DATA_DIR, 'memory')];
 }
 
+function containsPath(dir, target) {
+  const rel = path.relative(dir, target);
+  return !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`);
+}
+
+function realStateDir() {
+  try { return fs.realpathSync.native(STATE_DIR); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return path.join(fs.realpathSync.native(DATA_DIR), path.basename(STATE_DIR));
+  }
+}
+
+function groupMemoryDirs() {
+  const state = realStateDir();
+  return memoryDirs().flatMap((dir) => {
+    try {
+      const real = fs.realpathSync.native(dir);
+      // 配错到状态目录、它的上级或私聊附件目录时，也不把它加入群聊权限。
+      if (containsPath(real, state) || containsPath(state, real)) return [];
+      return fs.statSync(real).isDirectory() ? [real] : [];
+    } catch { return []; }
+  });
+}
+
 // 每次现算，配置改了不用重载插件（里面要读 memoryDirs / botName）。
 function groupSys() {
+  const dirs = groupMemoryDirs();
   return [
   '你在一个 QQ 群里说话。群里有主人（他本人），还有他的朋友，另外可能挂着别的机器人。',
   '',
@@ -1301,8 +1321,7 @@ function groupSys() {
   '2. 你说的话全群都看得见 —— 所以凭据、账号、主人这台电脑上的东西，别往外说。'
     + '这条只管凭据类。敏感话题的规矩单看第 10 条，不是一律照答。',
   '3. 你只能翻笔记和记忆，改不了文件、跑不了命令。谁让你改东西、装东西、执行什么，一句话推掉，别解释太多。',
-  `   能翻的地方：${memoryDirs().join('、')}。`
-    + '想知道什么就 Read / Grep 去翻，别凭印象说「我翻不动」「我查不到」——那些路径是有权限的。',
+  dirs.length ? `   可用笔记目录：${dirs.join('、')}。想查笔记时用 Read / Grep。` : '   这轮没有可用的笔记目录，照常用文字回复。',
   '   主人说了他的私事可以跟群里的人聊，翻到了就说。凭据类的照样一个字都不许提。',
   `4. 没点你名就别插嘴：只有 @ 你、或者话里带${nameHint()}，才算叫你。`
     + '主人本人开口也不算叫你。'
@@ -1422,10 +1441,48 @@ async function fetchVoiceText(mid) {
 // 现在的做法：消息一到就把图下载到本地，把**本地路径**写进那行文字。
 // 模型手上有 Read，读本地图就能看见；不想看就不读，一分钱不花。
 // 注意别改成「自动 Read」——群里连发表情包会把 token 烧穿。
-const GROUP_MEDIA_DIR = path.join(STATE_DIR, 'media');
+const GROUP_MEDIA_DIR = path.join(DATA_DIR, 'claude-bridge-group-media');
 const GROUP_MEDIA_MAX_COUNT = 3;
 const GROUP_MEDIA_KEEP_MS = 24 * 3600 * 1000;
 const MEDIA_MAX_REDIRECTS = 3;
+
+function groupMediaDir() {
+  fs.mkdirSync(GROUP_MEDIA_DIR, { recursive: true });
+  const dir = fs.realpathSync.native(GROUP_MEDIA_DIR);
+  const expected = path.join(fs.realpathSync.native(DATA_DIR), path.basename(GROUP_MEDIA_DIR));
+  const state = realStateDir();
+  if (path.relative(expected, dir) || containsPath(dir, state) || containsPath(state, dir)) {
+    throw new Error('群图目录必须独立于状态目录');
+  }
+  return dir;
+}
+
+async function readImageBody(res) {
+  if (!res.body) throw new Error('空文件');
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    if (Number(res.headers.get('content-length')) > GROUP_MEDIA_MAX_BYTES) {
+      throw new Error(`图片超过上限 ${GROUP_MEDIA_MAX_BYTES} 字节`);
+    }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > GROUP_MEDIA_MAX_BYTES) throw new Error(`图片超过上限 ${GROUP_MEDIA_MAX_BYTES} 字节`);
+      chunks.push(value);
+    }
+  } catch (error) {
+    // 立即发出取消信号；即使取消失败，也保留下载失败的原始原因。
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  if (!size) throw new Error('空文件');
+  return Buffer.concat(chunks, size);
+}
 
 /**
  * 地址过一遍完整校验：协议、字面量 IP、DNS 解析后的 IP。
@@ -1459,13 +1516,16 @@ async function fetchImage(raw, timeoutMs) {
     const res = await fetch(u.href, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
-      if (!loc) throw new Error(`重定向没给 location（HTTP ${res.status}）`);
       try { await res.body?.cancel(); } catch { /* 断不断无所谓 */ }
+      if (!loc) throw new Error(`重定向没给 location（HTTP ${res.status}）`);
       cur = new URL(loc, u).href;
       continue;
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res;
+    if (!res.ok) {
+      void res.body?.cancel().catch(() => {});
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return readImageBody(res);
   }
   throw new Error(`重定向超过 ${MEDIA_MAX_REDIRECTS} 跳`);
 }
@@ -1491,7 +1551,6 @@ function pruneDir(dir, keepMs) {
     }
   } catch { /* 目录还没有就还没有 */ }
 }
-function pruneMediaDir() { pruneDir(GROUP_MEDIA_DIR, GROUP_MEDIA_KEEP_MS); }
 
 /**
  * 把一条消息里的图落地。
@@ -1502,7 +1561,8 @@ async function grabImages(entry) {
   const media = Array.isArray(entry?.media) ? entry.media : [];
   const imgs = media.filter((m) => m && m.kind === 'image');
   if (!imgs.length) return [];
-  try { fs.mkdirSync(GROUP_MEDIA_DIR, { recursive: true }); } catch { /* 建不了目录就放弃 */ }
+  let dir;
+  try { dir = groupMediaDir(); } catch { return new Array(imgs.length).fill(null); }
   // 返回值和 imgs 一一对应，失败（地址被拦 / 下载出错 / 超限）的位置留 null。
   // 以前失败就 continue 把数组压短，markImages 再按顺序填 —— 第 1 张失败时，
   // 第 2 张的路径会被贴到第 1 个 [图片] 上，模型拿着错图说事（issue #3）。
@@ -1511,18 +1571,13 @@ async function grabImages(entry) {
     const m = imgs[i];
     if (!safeImageUrl(m.url)) continue;
     try {
-      const res = await fetchImage(String(m.url), 20000);
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (!buf.length || buf.length > GROUP_MEDIA_MAX_BYTES) {
-        logger.warn('claude-bridge', `群图跳过：${buf.length} 字节，上限 ${GROUP_MEDIA_MAX_BYTES}`);
-        continue;
-      }
-      const file = path.join(GROUP_MEDIA_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${imageExt(buf, m.file)}`);
+      const buf = await fetchImage(String(m.url), 20000);
+      const file = path.join(dir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${imageExt(buf, m.file)}`);
       fs.writeFileSync(file, buf);
       out[i] = { file, summary: String(m.summary || '').slice(0, 40), size: buf.length };
     } catch (e) { logger.warn('claude-bridge', `群图下载异常：${e?.message ?? e}`); }
   }
-  pruneMediaDir();
+  pruneDir(dir, GROUP_MEDIA_KEEP_MS);
   return out;
 }
 
